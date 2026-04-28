@@ -1871,6 +1871,17 @@ spec:
                     x-kubernetes-list-type: map
                   configServerCount:
                     type: integer
+                  failoverPhase:
+                    description: |-
+                      FailoverPhase tracks the current phase of a Monarch failover operation.
+                      Additional metadata (timestamps, messages) are in the FailoverInProgress condition.
+                    enum:
+                    - Idle
+                    - WaitingForAgent
+                    - SwappingInfrastructure
+                    - Complete
+                    - Failed
+                    type: string
                   featureCompatibilityVersion:
                     type: string
                   lastTransition:
@@ -1881,6 +1892,21 @@ spec:
                     type: integer
                   message:
                     type: string
+                  monarch:
+                    description: Monarch contains the observed Monarch disaster recovery
+                      state.
+                    properties:
+                      observedS3State:
+                        description: |-
+                          ObservedS3State is the last observed state from the S3 DR state file.
+                          Values: Active, Standby, PromoteStandby, StandbyReadyToPromote, or empty if not yet read.
+                        type: string
+                      observedS3StateTime:
+                        description: ObservedS3StateTime is the timestamp when the
+                          S3 DR state was last read.
+                        format: date-time
+                        type: string
+                    type: object
                   mongodsPerShardCount:
                     type: integer
                   mongosCount:

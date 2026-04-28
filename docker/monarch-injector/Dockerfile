@@ -13,8 +13,8 @@ RUN mkdir -p /var/log/monarch
 # These URLs are the same binaries used by automation and OM for testing.
 # To update the monarch version, replace both URLs with the new commit's paths.
 RUN case "${TARGETARCH}" in \
-        amd64) MONARCH_URL="https://internal-downloads.mongodb.com/monarch-dev/monarch_22ceab12b0f04eb91121cabd7e008fea5d7a2a72/amazon2-x86/monarch.tgz" ;; \
-        arm64) MONARCH_URL="https://internal-downloads.mongodb.com/monarch-dev/monarch_22ceab12b0f04eb91121cabd7e008fea5d7a2a72/amazon2023-arm64/monarch.tgz" ;; \
+        amd64) MONARCH_URL="https://internal-downloads.mongodb.com/monarch-dev/monarch_fbae5c69ee62e98efff3fbe7a569379c5a12823c/amazon2-x86/monarch.tgz" ;; \
+        arm64) MONARCH_URL="https://internal-downloads.mongodb.com/monarch-dev/monarch_fbae5c69ee62e98efff3fbe7a569379c5a12823c/amazon2023-arm64/monarch.tgz" ;; \
         *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac && \
     curl -fsSL "${MONARCH_URL}" | \

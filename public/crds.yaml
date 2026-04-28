@@ -995,67 +995,78 @@ spec:
               monarch:
                 description: Monarch configures disaster recovery using Monarch shipper/injector
                 properties:
-                  activeReplicaSetId:
-                    description: ActiveReplicaSetId is required for standby clusters
-                      - the name of the active RS
-                    type: string
-                  awsRegion:
-                    description: AWSRegion is the AWS region for the S3 bucket
-                    type: string
-                  clusterPrefix:
-                    description: ClusterPrefix is the Monarch cluster prefix for namespace
-                      isolation
-                    type: string
-                  credentialsSecretRef:
-                    description: CredentialsSecretRef references a Secret containing
-                      awsAccessKeyId and awsSecretAccessKey
-                    properties:
-                      name:
-                        default: ""
-                        description: |-
-                          Name of the referent.
-                          This field is effectively required, but due to backwards compatibility is
-                          allowed to be empty. Instances of this type with an empty value here are
-                          almost certainly wrong.
-                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                        type: string
-                    type: object
-                    x-kubernetes-map-type: atomic
                   image:
-                    description: Image overrides the default Monarch container image
-                    type: string
-                  injectorVersion:
-                    description: InjectorVersion is the Monarch binary version for
-                      standby clusters
+                    description: |-
+                      Image is the Monarch container image to use (e.g., "quay.io/mongodb/monarch:0.1.1").
+                      This must include the full image path and tag.
                     type: string
                   role:
                     description: Role determines whether this is an active (shipper)
-                      or standby (injector) cluster
+                      or standby (injector) cluster.
                     enum:
                     - active
                     - standby
                     type: string
-                  s3BucketEndpoint:
-                    description: S3BucketEndpoint is an optional S3-compatible endpoint
-                      (for MinIO, etc.)
-                    type: string
-                  s3BucketName:
-                    description: S3BucketName is the S3 bucket for storing/retrieving
-                      oplog data
-                    type: string
-                  s3PathStyleAccess:
-                    description: S3PathStyleAccess enables path-style access for S3-compatible
-                      stores
-                    type: boolean
-                  shipperVersion:
-                    description: ShipperVersion is the Monarch binary version for
-                      active clusters
-                    type: string
+                  s3:
+                    description: |-
+                      S3 configures the S3 bucket for oplog data.
+                      Active and standby clusters in a DR pair must use the same s3.prefix to share data.
+                    properties:
+                      bucket:
+                        description: Bucket is the S3 bucket name for storing/retrieving
+                          oplog data.
+                        type: string
+                      credentialsSecretRef:
+                        description: CredentialsSecretRef references a Secret containing
+                          awsAccessKeyId and awsSecretAccessKey.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      endpoint:
+                        description: |-
+                          Endpoint is the S3 endpoint URL. Required for S3-compatible stores like MinIO.
+                          If not specified, uses AWS S3's regional endpoint (https://s3.<region>.amazonaws.com).
+                          Examples:
+                            - MinIO: "http://minio.minio.svc:9000"
+                            - LocalStack: "http://localstack:4566"
+                        type: string
+                      pathStyle:
+                        description: |-
+                          PathStyle enables path-style addressing (http://endpoint/bucket/key) instead of
+                          virtual-hosted-style (http://bucket.endpoint/key). Required for MinIO and most
+                          S3-compatible stores. AWS S3 supports both but defaults to virtual-hosted.
+                        type: boolean
+                      prefix:
+                        description: |-
+                          Prefix is the key prefix (folder path) for all Monarch objects in the bucket.
+                          All oplog slices, manifests, and DR state files will be stored under this prefix.
+                          Defaults to the MongoDB resource name if not specified.
+                          Example: With prefix "prod/cluster-a", objects are stored as:
+                            s3://bucket/prod/cluster-a/0/slices/...
+                            s3://bucket/prod/cluster-a/dr_state.json
+                        type: string
+                      region:
+                        description: Region is the AWS region for the S3 bucket (e.g.,
+                          "us-east-1", "eu-west-1").
+                        type: string
+                    required:
+                    - bucket
+                    - credentialsSecretRef
+                    - region
+                    type: object
                 required:
-                - awsRegion
-                - credentialsSecretRef
+                - image
                 - role
-                - s3BucketName
+                - s3
                 type: object
               mongodsPerShardCount:
                 type: integer
@@ -2883,6 +2894,17 @@ spec:
                 x-kubernetes-list-type: map
               configServerCount:
                 type: integer
+              failoverPhase:
+                description: |-
+                  FailoverPhase tracks the current phase of a Monarch failover operation.
+                  Additional metadata (timestamps, messages) are in the FailoverInProgress condition.
+                enum:
+                - Idle
+                - WaitingForAgent
+                - SwappingInfrastructure
+                - Complete
+                - Failed
+                type: string
               featureCompatibilityVersion:
                 type: string
               lastTransition:
@@ -2893,6 +2915,21 @@ spec:
                 type: integer
               message:
                 type: string
+              monarch:
+                description: Monarch contains the observed Monarch disaster recovery
+                  state.
+                properties:
+                  observedS3State:
+                    description: |-
+                      ObservedS3State is the last observed state from the S3 DR state file.
+                      Values: Active, Standby, PromoteStandby, StandbyReadyToPromote, or empty if not yet read.
+                    type: string
+                  observedS3StateTime:
+                    description: ObservedS3StateTime is the timestamp when the S3
+                      DR state was last read.
+                    format: date-time
+                    type: string
+                type: object
               mongodsPerShardCount:
                 type: integer
               mongosCount:
@@ -6828,6 +6865,17 @@ spec:
                     x-kubernetes-list-type: map
                   configServerCount:
                     type: integer
+                  failoverPhase:
+                    description: |-
+                      FailoverPhase tracks the current phase of a Monarch failover operation.
+                      Additional metadata (timestamps, messages) are in the FailoverInProgress condition.
+                    enum:
+                    - Idle
+                    - WaitingForAgent
+                    - SwappingInfrastructure
+                    - Complete
+                    - Failed
+                    type: string
                   featureCompatibilityVersion:
                     type: string
                   lastTransition:
@@ -6838,6 +6886,21 @@ spec:
                     type: integer
                   message:
                     type: string
+                  monarch:
+                    description: Monarch contains the observed Monarch disaster recovery
+                      state.
+                    properties:
+                      observedS3State:
+                        description: |-
+                          ObservedS3State is the last observed state from the S3 DR state file.
+                          Values: Active, Standby, PromoteStandby, StandbyReadyToPromote, or empty if not yet read.
+                        type: string
+                      observedS3StateTime:
+                        description: ObservedS3StateTime is the timestamp when the
+                          S3 DR state was last read.
+                        format: date-time
+                        type: string
+                    type: object
                   mongodsPerShardCount:
                     type: integer
                   mongosCount:

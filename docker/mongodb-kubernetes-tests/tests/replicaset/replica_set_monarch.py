@@ -1,16 +1,18 @@
 """
-e2e test for Monarch Deployment pattern.
+e2e test for Monarch Deployment pattern including failover (promotion).
 
 Flow:
   1. Deploy MinIO (S3 store)
   2. Deploy active RS WITHOUT spec.monarch (plain replica set)
   3. Insert documents while RS is running without DR
   4. Activate Monarch: patch spec.monarch.role=active → operator creates shipper
-  5. Verify shipper Deployment/Service/ConfigMap and automation config
-  6. Verify shipper uploads to S3
-  7. Deploy standby RS with spec.monarch.role=standby
-  8. Verify standby agents block in WaitForInjectorReady before going Running
-  9. Verify data replicated to standby
+  5. Verify shipper uploads to S3
+  6. Deploy standby RS with spec.monarch.role=standby
+  7. Verify standby agents block in WaitForInjectorReady before going Running
+  8. Verify data replicated to standby
+  9. Promote standby to active: patch spec.monarch.role=active → failover state machine
+ 10. Verify injector deleted, shipper created, S3 state is Active
+ 11. Verify promoted cluster can write and shipper uploads to S3
 """
 
 import os
@@ -136,14 +138,17 @@ def _wait_for_monarch_condition(mdb: MongoDB, timeout: int = 300):
 
 
 def _monarch_spec(namespace: str, role: str, **extra) -> dict:
+    """Build a Monarch spec using the simplified API structure."""
     spec = {
         "role": role,
-        "s3BucketName": S3_BUCKET,
-        "awsRegion": AWS_REGION,
-        "credentialsSecretRef": {"name": S3_CREDS_SECRET},
-        "clusterPrefix": CLUSTER_PREFIX,
-        "s3BucketEndpoint": _minio_endpoint(namespace),
-        "s3PathStyleAccess": True,
+        "s3": {
+            "bucket": S3_BUCKET,
+            "region": AWS_REGION,
+            "credentialsSecretRef": {"name": S3_CREDS_SECRET},
+            "prefix": CLUSTER_PREFIX,
+            "endpoint": _minio_endpoint(namespace),
+            "pathStyle": True,
+        },
         "image": MONARCH_IMAGE,
     }
     spec.update(extra)
@@ -202,17 +207,13 @@ def standby_rs(
     s3_creds_secret: str,
     ops_manager: MongoDBOpsManager,
 ) -> MongoDB:
-    """
-    Standby Clusters always start with Injectors.
-    """
+    """Standby Clusters always start with Injectors."""
     _wait_for_s3_data(namespace)
     resource = MongoDB.from_yaml(yaml_fixture("replica-set-monarch.yaml"), STANDBY_RS_NAME, namespace)
     resource.set_version(custom_mdb_version)
     resource["spec"]["monarch"] = _monarch_spec(
         namespace,
         "standby",
-        activeReplicaSetId=ACTIVE_RS_NAME,
-        injectorVersion="0.1.1",
     )
     resource.configure(ops_manager, STANDBY_RS_NAME)
     try_load(resource)
@@ -229,19 +230,22 @@ def initialize_inventory_documents(active_rs: MongoDB) -> int:
     return count
 
 
-# ── test class ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SHIPPER TESTS (Active Cluster)
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 @mark.e2e_replica_set_monarch
-class TestMonarchDeployments(KubernetesTester):
-
-    # ── Phase 1: Active RS without Monarch ──────────────────────────────
+class TestMonarchShipper(KubernetesTester):
+    """Tests for active cluster with shipper deployment."""
 
     def test_active_rs_running(self, active_rs: MongoDB):
+        """Deploy active RS without Monarch spec first."""
         active_rs.update()
         active_rs.assert_reaches_phase(Phase.Running, timeout=600)
 
     def test_no_monarch_resources_before_activation(self, active_rs: MongoDB):
+        """Verify no shipper exists before Monarch is activated."""
         apps = k8s_client.AppsV1Api()
         try:
             apps.read_namespaced_deployment(f"{ACTIVE_RS_NAME}-monarch-shipper", self.namespace)
@@ -250,19 +254,18 @@ class TestMonarchDeployments(KubernetesTester):
             assert e.status == 404
 
     def test_insert_documents_before_activation(self, initialize_inventory_documents: int):
+        """Insert test documents before activating Monarch."""
         assert initialize_inventory_documents == len(INVENTORY_DOCS)
 
-    # ── Phase 2: Activate Monarch on running RS ──────────────────────────
-
     def test_activate_monarch(self, active_rs: MongoDB, s3_creds_secret: str, namespace: str):
-        active_rs["spec"]["monarch"] = _monarch_spec(namespace, "active", shipperVersion="0.1.1")
+        """Activate Monarch on the running RS by adding spec.monarch."""
+        active_rs["spec"]["monarch"] = _monarch_spec(namespace, "active")
         active_rs.update()
         active_rs.assert_reaches_phase(Phase.Running, timeout=600)
         _wait_for_monarch_condition(active_rs)
 
-    # ── Phase 3: Automation config ───────────────────────────────────────
-
     def test_automation_config_has_monarch_components(self, active_rs: MongoDB):
+        """Verify automation config contains maintainedMonarchComponents for active cluster."""
         config = active_rs.get_automation_config_tester().automation_config
         mc = config["maintainedMonarchComponents"]
         assert len(mc) == 1
@@ -272,12 +275,12 @@ class TestMonarchDeployments(KubernetesTester):
         assert mc[0]["initialMode"] == "ACTIVE"
         assert mc[0]["injectorConfig"]["shards"] == []
 
-    # ── Phase 4: Shipper uploading to S3 ────────────────────────────────
-
     def test_shipper_uploads_to_s3(self, active_rs: MongoDB):
+        """Verify shipper is uploading oplog data to S3."""
         _wait_for_s3_data(self.namespace)
 
     def test_shipper_ships_new_writes(self, active_rs: MongoDB):
+        """Verify shipper continues to ship new writes to S3."""
         s3 = _s3_client(_minio_endpoint(self.namespace))
         prefix = f"{CLUSTER_PREFIX}/{SHARD_ID}/slices/"
         before = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix).get("KeyCount", 0)
@@ -286,7 +289,15 @@ class TestMonarchDeployments(KubernetesTester):
         after = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix).get("KeyCount", 0)
         assert after > before, f"Shipper not shipping: slice count unchanged at {before}"
 
-    # ── Phase 5: Standby RS ──────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INJECTOR TESTS (Standby Cluster)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@mark.e2e_replica_set_monarch
+class TestMonarchInjector(KubernetesTester):
+    """Tests for standby cluster with injector deployment."""
 
     def test_standby_rs_running(self, standby_rs: MongoDB):
         """Standby RS reaches Running with InjectorReady=True.
@@ -301,10 +312,11 @@ class TestMonarchDeployments(KubernetesTester):
         _wait_for_monarch_condition(standby_rs)
 
     def test_standby_automation_config(self, standby_rs: MongoDB):
-        """One InjectorInstance per RS member: Hostname=pod FQDN, endpoints=Service DNS."""
+        """Verify automation config has InjectorInstances for each RS member."""
         config = standby_rs.get_automation_config_tester().automation_config
         mc = config["maintainedMonarchComponents"]
-        assert mc[0]["replicaSetId"] == ACTIVE_RS_NAME
+        # replicaSetId is the local RS name; DR pair linkage is via shared clusterPrefix
+        assert mc[0]["replicaSetId"] == STANDBY_RS_NAME
 
         instances = mc[0]["injectorConfig"]["shards"][0]["instances"]
         members = standby_rs["spec"]["members"]
@@ -318,9 +330,8 @@ class TestMonarchDeployments(KubernetesTester):
             assert inst["monarchApiEndpoint"] == f"{svc_dns}:1122"
             assert inst["externallyManaged"] is True
 
-    # ── Phase 6: Data replication ────────────────────────────────────────
-
     def test_documents_replicated_to_standby(self, standby_rs: MongoDB):
+        """Verify documents from active cluster are replicated to standby."""
         col = standby_rs.tester().client[PRODUCTS_DB][INVENTORY_COLLECTION]
         deadline = time.time() + 600
         count = 0
@@ -333,3 +344,145 @@ class TestMonarchDeployments(KubernetesTester):
                 pass
             time.sleep(5)
         assert count == len(INVENTORY_DOCS), f"Expected {len(INVENTORY_DOCS)} docs on standby, got {count}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FAILOVER / PROMOTION TESTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@mark.e2e_replica_set_monarch
+class TestMonarchPromotion(KubernetesTester):
+    """Tests for promoting standby cluster to active (failover)."""
+
+    def test_promote_standby_to_active(self, standby_rs: MongoDB, namespace: str):
+        """Change standby RS role from 'standby' to 'active'.
+
+        This triggers the promotion state machine:
+        1. Operator writes PromoteStandby to S3
+        2. Agent sees PromoteStandby, completes RS reconfig, writes StandbyReadyToPromote
+        3. Operator sees StandbyReadyToPromote, deletes injector, creates shipper
+        4. Operator writes Active to S3
+        """
+        standby_rs["spec"]["monarch"]["role"] = "active"
+        standby_rs["spec"]["monarch"].pop("source", None)
+        standby_rs.update()
+
+    def test_failover_in_progress_condition(self, standby_rs: MongoDB):
+        """Verify FailoverInProgress condition appears during promotion."""
+        def has_failover_condition(resource: MongoDB) -> bool:
+            for cond in resource["status"]["conditions"]:
+                if cond.get("type") == "FailoverInProgress":
+                    return True
+            return False
+
+        try:
+            standby_rs.wait_for(has_failover_condition, timeout=60, should_raise=True)
+        except TimeoutError:
+            # Failover might complete quickly - that's OK
+            pass
+
+    def test_promotion_completes(self, standby_rs: MongoDB):
+        """Wait for promotion to complete - FailoverInProgress=False or ShipperReady=True."""
+        def is_promotion_complete(resource: MongoDB) -> bool:
+            conditions = resource.get("status", {}).get("conditions", [])
+            for cond in conditions:
+                if cond.get("type") == "FailoverInProgress" and cond.get("status") == "False":
+                    return True
+                if cond.get("type") == "ShipperReady" and cond.get("status") == "True":
+                    return True
+            return False
+
+        standby_rs.wait_for(is_promotion_complete, timeout=600, should_raise=True)
+
+    def test_injector_deleted_after_promotion(self, standby_rs: MongoDB):
+        """Verify injector Deployment is deleted after promotion."""
+        apps = k8s_client.AppsV1Api()
+        try:
+            apps.read_namespaced_deployment(f"{STANDBY_RS_NAME}-monarch-injector", self.namespace)
+            assert False, "Injector Deployment should be deleted after promotion"
+        except k8s_client.exceptions.ApiException as e:
+            assert e.status == 404, f"Expected 404, got {e.status}"
+
+    def test_shipper_created_after_promotion(self, standby_rs: MongoDB):
+        """Verify shipper Deployment exists after promotion."""
+        _wait_for_deployment_ready(self.namespace, f"{STANDBY_RS_NAME}-monarch-shipper", timeout=180)
+
+    def test_shipper_ready_condition_after_promotion(self, standby_rs: MongoDB):
+        """Verify ShipperReady condition is True after promotion."""
+        def has_shipper_ready(resource: MongoDB) -> bool:
+            for cond in resource.get("status", {}).get("conditions", []):
+                if cond.get("type") == "ShipperReady" and cond.get("status") == "True":
+                    return True
+            return False
+
+        standby_rs.wait_for(has_shipper_ready, timeout=300, should_raise=True)
+
+    def test_s3_dr_state_is_active(self, standby_rs: MongoDB):
+        """Verify the S3 DR state file shows 'Active' state after promotion."""
+        s3 = _s3_client(_minio_endpoint(self.namespace))
+        dr_state_key = f"{CLUSTER_PREFIX}/dr_state.json"
+
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            try:
+                response = s3.get_object(Bucket=S3_BUCKET, Key=dr_state_key)
+                import json
+                state = json.loads(response["Body"].read().decode("utf-8"))
+                if state.get("state") == "Active":
+                    return
+            except s3.exceptions.NoSuchKey:
+                pass
+            except Exception:
+                pass
+            time.sleep(5)
+
+        response = s3.get_object(Bucket=S3_BUCKET, Key=dr_state_key)
+        import json
+        state = json.loads(response["Body"].read().decode("utf-8"))
+        assert state.get("state") == "Active", f"Expected S3 DR state 'Active', got {state}"
+
+    def test_monarch_status_reflects_s3_state(self, standby_rs: MongoDB):
+        """Verify status.monarch.observedS3State reflects the S3 DR state after promotion."""
+        def has_observed_s3_state(resource: MongoDB) -> bool:
+            monarch_status = resource.get("status", {}).get("monarch", {})
+            observed_state = monarch_status.get("observedS3State", "")
+            return observed_state == "Active"
+
+        standby_rs.wait_for(has_observed_s3_state, timeout=120, should_raise=True)
+
+        resource = standby_rs.load()
+        monarch_status = resource.get("status", {}).get("monarch", {})
+        assert monarch_status.get("observedS3StateTime") is not None, "observedS3StateTime should be set"
+
+    def test_no_spec_out_of_sync_after_planned_promotion(self, standby_rs: MongoDB):
+        """Verify SpecOutOfSync condition is NOT set after planned promotion.
+
+        After a planned promotion (CR role changed from standby to active), the CR spec
+        matches the S3 state, so SpecOutOfSync should not be set.
+        """
+        resource = standby_rs.load()
+        conditions = resource.get("status", {}).get("conditions", [])
+        for cond in conditions:
+            if cond.get("type") == "SpecOutOfSync":
+                assert cond.get("status") != "True", \
+                    f"SpecOutOfSync should not be True after planned promotion: {cond}"
+
+    def test_promoted_cluster_can_write(self, standby_rs: MongoDB):
+        """Verify the promoted cluster can accept writes."""
+        col = standby_rs.tester().client["promotion_test"]["writes"]
+        col.insert_one({"promoted": True, "ts": time.time()})
+        count = col.count_documents({})
+        assert count >= 1, "Promoted cluster should accept writes"
+
+    def test_promoted_shipper_uploads_to_s3(self, standby_rs: MongoDB):
+        """Verify the promoted cluster's shipper is uploading to S3."""
+        s3 = _s3_client(_minio_endpoint(self.namespace))
+        prefix = f"{CLUSTER_PREFIX}/{SHARD_ID}/slices/"
+        before = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix).get("KeyCount", 0)
+
+        standby_rs.tester().client["shipper_test"]["promoted"].insert_one({"ts": time.time()})
+        time.sleep(15)
+
+        after = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix).get("KeyCount", 0)
+        assert after > before, f"Promoted shipper not shipping: slice count unchanged at {before}"

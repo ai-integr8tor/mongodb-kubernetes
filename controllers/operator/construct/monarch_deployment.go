@@ -118,21 +118,21 @@ aws:
   bucketName: %s
   region: %s`,
 		role,
-		spec.ClusterPrefix,
+		spec.S3.GetPrefix(mdb.Name),
 		mdb.Name,
 		replSetHostsYAML,
 		srcURI,
 		srcURI, // backupMongoNodeURI uses same URI for now
-		spec.S3BucketName,
-		spec.AWSRegion,
+		spec.S3.Bucket,
+		spec.S3.Region,
 	)
 
 	// Add optional S3 endpoint config for MinIO/LocalStack
-	if spec.S3BucketEndpoint != "" {
+	if spec.S3.Endpoint != "" {
 		config += fmt.Sprintf(`
-  customBaseEndpoint: %s`, spec.S3BucketEndpoint)
+  customBaseEndpoint: %s`, spec.S3.Endpoint)
 	}
-	if spec.S3PathStyleAccess {
+	if spec.S3.PathStyle {
 		config += `
   usePathStyle: true`
 	}
@@ -180,7 +180,7 @@ func BuildMonarchDeployment(mdb *mdbv1.MongoDB, namespace string) *appsv1.Deploy
 			Name: "AWS_ACCESS_KEY_ID",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: spec.CredentialsSecretRef.Name},
+					LocalObjectReference: corev1.LocalObjectReference{Name: spec.S3.CredentialsSecretRef.Name},
 					Key:                  "awsAccessKeyId",
 				},
 			},
@@ -189,7 +189,7 @@ func BuildMonarchDeployment(mdb *mdbv1.MongoDB, namespace string) *appsv1.Deploy
 			Name: "AWS_SECRET_ACCESS_KEY",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: spec.CredentialsSecretRef.Name},
+					LocalObjectReference: corev1.LocalObjectReference{Name: spec.S3.CredentialsSecretRef.Name},
 					Key:                  "awsSecretAccessKey",
 				},
 			},

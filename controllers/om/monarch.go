@@ -2,6 +2,7 @@ package om
 
 import (
 	"fmt"
+	"strings"
 
 	mdbv1 "github.com/mongodb/mongodb-kubernetes/api/v1/mdb"
 )
@@ -16,7 +17,7 @@ type MaintainedMonarchComponents struct {
 	AWSRegion          string         `json:"awsRegion"`
 	AWSAccessKeyID     string         `json:"awsAccessKeyId"`
 	AWSSecretAccessKey string         `json:"awsSecretAccessKey"`
-	S3BucketEndpoint   string         `json:"s3BucketEndpoint,omitempty"`
+	S3BucketEndpoint   string         `json:"s3BucketEndPoint,omitempty"`
 	S3PathStyleAccess  bool           `json:"s3PathStyleAccess,omitempty"`
 	InjectorConfig     InjectorConfig `json:"injectorConfig"`
 }
@@ -65,46 +66,51 @@ func BuildMaintainedMonarchComponents(mdb *mdbv1.MongoDB, rsName string, awsAcce
 		initialMode = "ACTIVE"
 	}
 
+	// ReplicaSetID is the local RS name. Active and standby clusters in a DR pair
+	// are linked via the shared s3.prefix (ClusterPrefix), not via ReplicaSetID.
 	mc := MaintainedMonarchComponents{
 		ReplicaSetID:       rsName,
-		ClusterPrefix:      monarch.ClusterPrefix,
+		ClusterPrefix:      monarch.S3.GetPrefix(rsName),
 		InitialMode:        initialMode,
-		AWSBucketName:      monarch.S3BucketName,
-		AWSRegion:          monarch.AWSRegion,
+		AWSBucketName:      monarch.S3.Bucket,
+		AWSRegion:          monarch.S3.Region,
 		AWSAccessKeyID:     awsAccessKeyId,
 		AWSSecretAccessKey: awsSecretAccessKey,
-		S3BucketEndpoint:   monarch.S3BucketEndpoint,
-		S3PathStyleAccess:  monarch.S3PathStyleAccess,
+		S3BucketEndpoint:   monarch.S3.Endpoint,
+		S3PathStyleAccess:  monarch.S3.PathStyle,
 	}
 
+	// Extract version from image tag (e.g., "quay.io/mongodb/monarch:0.1.1" -> "0.1.1")
+	version := extractVersionFromImage(monarch.Image)
+
 	if monarch.Role == mdbv1.MonarchRoleActive {
-		// Active clusters use the active RS name and shipper version.
+		// Active clusters use shipper.
 		mc.InjectorConfig = InjectorConfig{
-			Version: monarch.ShipperVersion,
+			Version: version,
 			Shards:  []InjectorShard{},
 		}
 	} else {
-		// Standby clusters need injector instances pointing at each member's Service DNS.
-		activeRSName := monarch.ActiveReplicaSetId
-		if activeRSName == "" {
-			activeRSName = rsName
-		}
-		mc.ReplicaSetID = activeRSName
-
-		instances := make([]InjectorInstance, len(memberHostnames))
-		for i, fqdn := range memberHostnames {
-			instances[i] = InjectorInstance{
-				ID:                 i,
-				Hostname:           fqdn,
+		// Standby clusters need injector instance configuration.
+		// In MCK, the injector runs as a separate Deployment behind a shared K8s Service.
+		// Unlike the EA setup (where one injector runs on each mongod host), we have a
+		// single Service endpoint that load-balances to injector pods.
+		//
+		// We create ONE injector instance pointing to the Service DNS. MongoDB RS will
+		// have this single injector member added with voting rights. The K8s Service
+		// provides high availability via its pod selector.
+		instances := []InjectorInstance{
+			{
+				ID:                 0,
+				Hostname:           serviceDNS, // Use Service DNS - injector is a separate Deployment
 				Port:               9995,
 				ExternallyManaged:  true,
 				HealthAPIEndpoint:  serviceDNS + ":8080",
 				MonarchAPIEndpoint: serviceDNS + ":1122",
-			}
+			},
 		}
 
 		mc.InjectorConfig = InjectorConfig{
-			Version: monarch.InjectorVersion,
+			Version: version,
 			Shards: []InjectorShard{
 				{
 					ShardID:     "0",
@@ -116,4 +122,23 @@ func BuildMaintainedMonarchComponents(mdb *mdbv1.MongoDB, rsName string, awsAcce
 	}
 
 	return []MaintainedMonarchComponents{mc}, nil
+}
+
+// extractVersionFromImage extracts the tag from a container image reference.
+// e.g., "quay.io/mongodb/monarch:0.1.1" -> "0.1.1"
+// If no tag is found, returns "latest".
+func extractVersionFromImage(image string) string {
+	// Handle digest references (image@sha256:...)
+	if idx := strings.LastIndex(image, "@"); idx != -1 {
+		return "latest" // digest-based images don't have a version tag
+	}
+	// Handle tag references (image:tag)
+	if idx := strings.LastIndex(image, ":"); idx != -1 {
+		// Make sure we're not matching a port in the registry (e.g., localhost:5000/image)
+		tag := image[idx+1:]
+		if !strings.Contains(tag, "/") {
+			return tag
+		}
+	}
+	return "latest"
 }

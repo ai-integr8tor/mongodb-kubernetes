@@ -94,15 +94,15 @@ func newMonarchMDB(role mdbv1.MonarchRole) *mdbv1.MongoDB {
 		Spec: mdbv1.MongoDbSpec{
 			Members: 3,
 			Monarch: &mdbv1.MonarchSpec{
-				Role:               role,
-				S3BucketName:       "my-bucket",
-				AWSRegion:          "us-east-1",
-				ClusterPrefix:      "failoverdemo",
-				S3BucketEndpoint:   "http://minio:9000",
-				S3PathStyleAccess:  true,
-				ShipperVersion:     "0.1.1",
-				InjectorVersion:    "0.1.1",
-				ActiveReplicaSetId: "active-rs",
+				Role:  role,
+				Image: "quay.io/mongodb/monarch:0.1.1",
+				S3: mdbv1.MonarchS3Config{
+					Bucket:    "my-bucket",
+					Region:    "us-east-1",
+					Prefix:    "failoverdemo",
+					Endpoint:  "http://minio:9000",
+					PathStyle: true,
+				},
 			},
 		},
 	}
@@ -122,8 +122,8 @@ func TestBuildMaintainedMonarchComponents_Standby(t *testing.T) {
 	require.Len(t, result, 1)
 
 	mc := result[0]
-	// Standby uses the ActiveReplicaSetId as the ReplicaSetID.
-	assert.Equal(t, "active-rs", mc.ReplicaSetID)
+	// ReplicaSetID is the local RS name. DR pair linkage is via shared ClusterPrefix.
+	assert.Equal(t, "standby-rs", mc.ReplicaSetID)
 	assert.Equal(t, "failoverdemo", mc.ClusterPrefix)
 	assert.Equal(t, "my-bucket", mc.AWSBucketName)
 	assert.Equal(t, "us-east-1", mc.AWSRegion)
@@ -138,16 +138,17 @@ func TestBuildMaintainedMonarchComponents_Standby(t *testing.T) {
 	shard := mc.InjectorConfig.Shards[0]
 	assert.Equal(t, "0", shard.ShardID)
 	assert.Equal(t, "standby-rs", shard.ReplSetName)
-	require.Len(t, shard.Instances, 3)
+	// In MCK, we have ONE injector instance pointing to the shared Service DNS.
+	// The K8s Service load-balances to multiple injector pods.
+	require.Len(t, shard.Instances, 1)
 
-	for i, inst := range shard.Instances {
-		assert.Equal(t, i, inst.ID)
-		assert.Equal(t, memberHostnames[i], inst.Hostname)
-		assert.Equal(t, 9995, inst.Port)
-		assert.True(t, inst.ExternallyManaged)
-		assert.Equal(t, serviceDNS+":8080", inst.HealthAPIEndpoint)
-		assert.Equal(t, serviceDNS+":1122", inst.MonarchAPIEndpoint)
-	}
+	inst := shard.Instances[0]
+	assert.Equal(t, 0, inst.ID)
+	assert.Equal(t, serviceDNS, inst.Hostname) // Uses Service DNS, not RS pod FQDN
+	assert.Equal(t, 9995, inst.Port)
+	assert.True(t, inst.ExternallyManaged)
+	assert.Equal(t, serviceDNS+":8080", inst.HealthAPIEndpoint)
+	assert.Equal(t, serviceDNS+":1122", inst.MonarchAPIEndpoint)
 }
 
 func TestBuildMaintainedMonarchComponents_Active(t *testing.T) {

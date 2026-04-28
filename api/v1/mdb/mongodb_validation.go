@@ -469,6 +469,26 @@ func ValidateFCV(fcvStringPointer *string) v1.ValidationResult {
 	return v1.ValidationResult{}
 }
 
+// monarchConfigRequired validates that Monarch spec has required configuration.
+func monarchConfigRequired(m MongoDbSpec) v1.ValidationResult {
+	if m.Monarch == nil {
+		return v1.ValidationSuccess()
+	}
+	if m.Monarch.Image == "" {
+		return v1.ValidationError("spec.monarch.image is required")
+	}
+	if m.Monarch.S3.Bucket == "" {
+		return v1.ValidationError("spec.monarch.s3.bucket is required")
+	}
+	if m.Monarch.S3.Region == "" {
+		return v1.ValidationError("spec.monarch.s3.region is required")
+	}
+	if m.Monarch.S3.CredentialsSecretRef.Name == "" {
+		return v1.ValidationError("spec.monarch.s3.credentialsSecretRef.name is required")
+	}
+	return v1.ValidationSuccess()
+}
+
 func (m *MongoDB) RunValidations(old *MongoDB) []v1.ValidationResult {
 	// The below validators apply to all MongoDB resource (but not MongoDBMulti), regardless of the value of the
 	// Topology field
@@ -477,6 +497,7 @@ func (m *MongoDB) RunValidations(old *MongoDB) []v1.ValidationResult {
 		horizonDomainNamesMustBeValid,
 		additionalMongodConfig,
 		replicasetMemberIsSpecified,
+		monarchConfigRequired,
 	}
 
 	updateValidators := []func(newObj MongoDbSpec, oldObj MongoDbSpec) v1.ValidationResult{

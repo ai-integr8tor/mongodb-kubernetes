@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 
 	v1 "github.com/mongodb/mongodb-kubernetes/api/v1"
@@ -725,6 +726,83 @@ func TestOIDCProviderConfigUniqueIssuerURIValidation(t *testing.T) {
 			result := validationFunc(dbSpec)
 
 			assert.Equal(t, tt.expectedResult, result)
+		})
+	}
+}
+
+func TestMongoDB_MonarchConfigRequired(t *testing.T) {
+	tests := []struct {
+		name        string
+		monarch     *MonarchSpec
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name:        "No monarch spec",
+			monarch:     nil,
+			expectError: false,
+		},
+		{
+			name: "Missing image",
+			monarch: &MonarchSpec{
+				Role: MonarchRoleActive,
+				S3: MonarchS3Config{
+					Bucket: "bucket",
+					Region: "us-east-1",
+				},
+			},
+			expectError: true,
+			errorMsg:    "spec.monarch.image is required",
+		},
+		{
+			name: "Missing bucket",
+			monarch: &MonarchSpec{
+				Role:  MonarchRoleActive,
+				Image: "quay.io/mongodb/monarch:0.1.1",
+				S3: MonarchS3Config{
+					Region: "us-east-1",
+				},
+			},
+			expectError: true,
+			errorMsg:    "spec.monarch.s3.bucket is required",
+		},
+		{
+			name: "Missing region",
+			monarch: &MonarchSpec{
+				Role:  MonarchRoleActive,
+				Image: "quay.io/mongodb/monarch:0.1.1",
+				S3: MonarchS3Config{
+					Bucket: "bucket",
+				},
+			},
+			expectError: true,
+			errorMsg:    "spec.monarch.s3.region is required",
+		},
+		{
+			name: "Valid config",
+			monarch: &MonarchSpec{
+				Role:  MonarchRoleActive,
+				Image: "quay.io/mongodb/monarch:0.1.1",
+				S3: MonarchS3Config{
+					Bucket:               "bucket",
+					Region:               "us-east-1",
+					CredentialsSecretRef: corev1.LocalObjectReference{Name: "creds"},
+				},
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := MongoDbSpec{Monarch: tt.monarch}
+			result := monarchConfigRequired(spec)
+			if tt.expectError {
+				assert.Equal(t, v1.ErrorLevel, result.Level)
+				assert.Equal(t, tt.errorMsg, result.Msg)
+			} else {
+				assert.Equal(t, v1.ValidationSuccess(), result)
+			}
 		})
 	}
 }

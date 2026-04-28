@@ -83,6 +83,14 @@ const (
 	ConditionShipperReady = "ShipperReady"
 	// ConditionInjectorReady indicates whether the Monarch injector Deployment (standby cluster) is ready.
 	ConditionInjectorReady = "InjectorReady"
+	// ConditionFailoverInProgress indicates a failover operation is underway.
+	ConditionFailoverInProgress = "FailoverInProgress"
+	// ConditionFailoverComplete indicates the last failover completed successfully.
+	ConditionFailoverComplete = "FailoverComplete"
+	// ConditionSpecOutOfSync indicates that the CR spec.monarch.role differs from the S3 DR state.
+	// This can happen during unplanned failover when an external tool (CLI) writes to S3 directly.
+	// The operator follows S3 for infrastructure but preserves user's spec (K8s convention).
+	ConditionSpecOutOfSync = "SpecOutOfSync"
 )
 
 // Monarch condition reasons
@@ -90,49 +98,103 @@ const (
 	ReasonMonarchDeploymentReady   = "DeploymentReady"
 	ReasonMonarchDeploymentPending = "DeploymentPending"
 	ReasonMonarchDeploymentFailed  = "DeploymentFailed"
+	// Failover reasons
+	ReasonFailoverStarted         = "FailoverStarted"
+	ReasonFailoverWaitingForAgent = "WaitingForAgent"
+	ReasonFailoverSwappingInfra   = "SwappingInfrastructure"
+	ReasonFailoverSucceeded       = "FailoverSucceeded"
+	ReasonFailoverFailed          = "FailoverFailed"
 )
 
-// MonarchSpec configures Monarch disaster recovery for this MongoDB cluster
+// FailoverPhase indicates the current phase of a failover operation.
+// +kubebuilder:validation:Enum=Idle;WaitingForAgent;SwappingInfrastructure;Complete;Failed
+type FailoverPhase string
+
+const (
+	FailoverPhaseIdle               FailoverPhase = "Idle"
+	FailoverPhaseWaitingForAgent    FailoverPhase = "WaitingForAgent"
+	FailoverPhaseSwappingInfrastructure FailoverPhase = "SwappingInfrastructure"
+	FailoverPhaseComplete           FailoverPhase = "Complete"
+	FailoverPhaseFailed             FailoverPhase = "Failed"
+)
+
+
+// MonarchSpec configures Monarch disaster recovery for this MongoDB cluster.
+//
+// Minimal example (active cluster):
+//
+//	monarch:
+//	  role: active
+//	  s3:
+//	    bucket: my-bucket
+//	    region: us-east-1
+//	    credentialsSecretRef:
+//	      name: aws-creds
+//
+// Minimal example (standby cluster):
+//
+//	monarch:
+//	  role: standby
+//	  source: active-cluster-name
+//	  s3:
+//	    bucket: my-bucket
+//	    region: us-east-1
+//	    credentialsSecretRef:
+//	      name: aws-creds
 type MonarchSpec struct {
-	// Role determines whether this is an active (shipper) or standby (injector) cluster
+	// Role determines whether this is an active (shipper) or standby (injector) cluster.
 	Role MonarchRole `json:"role"`
 
-	// S3BucketName is the S3 bucket for storing/retrieving oplog data
-	S3BucketName string `json:"s3BucketName"`
+	// S3 configures the S3 bucket for oplog data.
+	// Active and standby clusters in a DR pair must use the same s3.prefix to share data.
+	S3 MonarchS3Config `json:"s3"`
 
-	// AWSRegion is the AWS region for the S3 bucket
-	AWSRegion string `json:"awsRegion"`
+	// Image is the Monarch container image to use (e.g., "quay.io/mongodb/monarch:0.1.1").
+	// This must include the full image path and tag.
+	Image string `json:"image"`
+}
 
-	// CredentialsSecretRef references a Secret containing awsAccessKeyId and awsSecretAccessKey
+// MonarchS3Config configures the S3 bucket for Monarch oplog data.
+type MonarchS3Config struct {
+	// Bucket is the S3 bucket name for storing/retrieving oplog data.
+	Bucket string `json:"bucket"`
+
+	// Region is the AWS region for the S3 bucket (e.g., "us-east-1", "eu-west-1").
+	Region string `json:"region"`
+
+	// CredentialsSecretRef references a Secret containing awsAccessKeyId and awsSecretAccessKey.
 	CredentialsSecretRef corev1.LocalObjectReference `json:"credentialsSecretRef"`
 
+	// Endpoint is the S3 endpoint URL. Required for S3-compatible stores like MinIO.
+	// If not specified, uses AWS S3's regional endpoint (https://s3.<region>.amazonaws.com).
+	// Examples:
+	//   - MinIO: "http://minio.minio.svc:9000"
+	//   - LocalStack: "http://localstack:4566"
 	// +optional
-	// S3BucketEndpoint is an optional S3-compatible endpoint (for MinIO, etc.)
-	S3BucketEndpoint string `json:"s3BucketEndpoint,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`
 
+	// PathStyle enables path-style addressing (http://endpoint/bucket/key) instead of
+	// virtual-hosted-style (http://bucket.endpoint/key). Required for MinIO and most
+	// S3-compatible stores. AWS S3 supports both but defaults to virtual-hosted.
 	// +optional
-	// S3PathStyleAccess enables path-style access for S3-compatible stores
-	S3PathStyleAccess bool `json:"s3PathStyleAccess,omitempty"`
+	PathStyle bool `json:"pathStyle,omitempty"`
 
+	// Prefix is the key prefix (folder path) for all Monarch objects in the bucket.
+	// All oplog slices, manifests, and DR state files will be stored under this prefix.
+	// Defaults to the MongoDB resource name if not specified.
+	// Example: With prefix "prod/cluster-a", objects are stored as:
+	//   s3://bucket/prod/cluster-a/0/slices/...
+	//   s3://bucket/prod/cluster-a/dr_state.json
 	// +optional
-	// ActiveReplicaSetId is required for standby clusters - the name of the active RS
-	ActiveReplicaSetId string `json:"activeReplicaSetId,omitempty"`
+	Prefix string `json:"prefix,omitempty"`
+}
 
-	// +optional
-	// ClusterPrefix is the Monarch cluster prefix for namespace isolation
-	ClusterPrefix string `json:"clusterPrefix,omitempty"`
-
-	// +optional
-	// ShipperVersion is the Monarch binary version for active clusters
-	ShipperVersion string `json:"shipperVersion,omitempty"`
-
-	// +optional
-	// InjectorVersion is the Monarch binary version for standby clusters
-	InjectorVersion string `json:"injectorVersion,omitempty"`
-
-	// +optional
-	// Image overrides the default Monarch container image
-	Image string `json:"image,omitempty"`
+// GetPrefix returns the S3 prefix, defaulting to the MongoDB resource name if not specified.
+func (s *MonarchS3Config) GetPrefix(mdbName string) string {
+	if s.Prefix != "" {
+		return s.Prefix
+	}
+	return mdbName
 }
 
 // MongoDB resources allow you to deploy Standalones, ReplicaSets or SharedClusters
@@ -440,6 +502,26 @@ type MongoDbStatus struct {
 	// +patchMergeKey=type
 	// +patchStrategy=merge
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+	// FailoverPhase tracks the current phase of a Monarch failover operation.
+	// Additional metadata (timestamps, messages) are in the FailoverInProgress condition.
+	// +optional
+	FailoverPhase FailoverPhase `json:"failoverPhase,omitempty"`
+	// Monarch contains the observed Monarch disaster recovery state.
+	// +optional
+	Monarch *MonarchStatus `json:"monarch,omitempty"`
+}
+
+// MonarchStatus reflects the observed Monarch disaster recovery state.
+// It tracks the last observed S3 DR state file contents, which is the coordination
+// point between the operator and agent during failover.
+type MonarchStatus struct {
+	// ObservedS3State is the last observed state from the S3 DR state file.
+	// Values: Active, Standby, PromoteStandby, StandbyReadyToPromote, or empty if not yet read.
+	// +optional
+	ObservedS3State string `json:"observedS3State,omitempty"`
+	// ObservedS3StateTime is the timestamp when the S3 DR state was last read.
+	// +optional
+	ObservedS3StateTime *metav1.Time `json:"observedS3StateTime,omitempty"`
 }
 
 type BackupMode string
