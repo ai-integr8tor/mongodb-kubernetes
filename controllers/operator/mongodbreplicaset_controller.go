@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"strings"
 
 	"github.com/hashicorp/go-multierror"
 	"go.uber.org/zap"
@@ -323,6 +324,12 @@ func (r *ReplicaSetReconcilerHelper) Reconcile(ctx context.Context) (reconcile.R
 			return r.reconcileMemberResources(ctx, conn, projectConfig, deploymentOpts, r.deploymentState.LastConfiguredRoles)
 		})
 
+	// Surface agent plan failures regardless of outcome so users can diagnose stuck
+	// reconciles without exec'ing into pods. Runs after the AC push (regardless of
+	// status) so it reflects the most recent agent state; must be before the
+	// status check below that may short-circuit on Pending/Failed.
+	r.surfaceAgentPlanStatus(ctx, conn)
+
 	if !status.IsOK() {
 		return r.updateStatus(ctx, status)
 	}
@@ -634,6 +641,46 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarchResources(ctx context.Conte
 	})
 	log.Infof("Reconciled Monarch %s K8s resources", monarchRole)
 	return workflow.OK()
+}
+
+// surfaceAgentPlanStatus reads OM's automation status and reflects any agent plan
+// execution failures on the CR via ConditionAgentPlanStuck. The agent's readiness
+// probe stays "ready" on stuck plans and the reconcile returns a generic
+// "StatefulSet not ready" Pending — this condition gives users the real reason
+// (e.g. a specific failing step on a specific process) directly on the CR.
+//
+// Best-effort: OM API errors are logged and ignored. Clears the condition when no
+// failing process is seen.
+func (r *ReplicaSetReconcilerHelper) surfaceAgentPlanStatus(ctx context.Context, conn om.Connection) {
+	rs := r.resource
+	log := r.log
+	_ = ctx // future-proofing: OM client does not take ctx today
+
+	as, err := conn.ReadAutomationStatus()
+	if err != nil {
+		log.Debugw("Could not read automation status for plan-error surfacing", "error", err)
+		return
+	}
+
+	// Match processes belonging to this replica set. Process names for a replica set
+	// are the pod names (e.g. "monarch-standby-rs-0"), so a prefix match against the
+	// RS name filters correctly.
+	prefix := rs.Name + "-"
+	for _, p := range as.Processes {
+		if p.Name != rs.Name && !strings.HasPrefix(p.Name, prefix) {
+			continue
+		}
+		if p.HasPlanError() {
+			apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
+				Type:    mdbv1.ConditionAgentPlanStuck,
+				Status:  metav1.ConditionTrue,
+				Reason:  mdbv1.ReasonAgentPlanError,
+				Message: fmt.Sprintf("%s: %s", p.Name, p.ErrorString),
+			})
+			return
+		}
+	}
+	apimeta.RemoveStatusCondition(&rs.Status.Conditions, mdbv1.ConditionAgentPlanStuck)
 }
 
 // buildMonarchComponentsForAC builds the maintainedMonarchComponents payload for

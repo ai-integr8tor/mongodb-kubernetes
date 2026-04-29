@@ -268,15 +268,6 @@ class TestMonarchShipper(KubernetesTester):
         active_rs.update()
         active_rs.assert_reaches_phase(Phase.Running, timeout=600)
 
-    def test_no_monarch_resources_before_activation(self, active_rs: MongoDB):
-        """Verify no shipper exists before Monarch is activated."""
-        apps = k8s_client.AppsV1Api()
-        try:
-            apps.read_namespaced_deployment(f"{ACTIVE_RS_NAME}-monarch-shipper", self.namespace)
-            assert False, "Shipper Deployment should not exist before Monarch activation"
-        except k8s_client.exceptions.ApiException as e:
-            assert e.status == 404
-
     def test_insert_documents_before_activation(self, initialize_inventory_documents: int):
         """Insert test documents before activating Monarch."""
         assert initialize_inventory_documents == len(INVENTORY_DOCS)

@@ -94,6 +94,10 @@ const (
 	// ConditionMonarchS3Unreachable indicates the operator cannot read the Monarch S3 DR state file.
 	// Failover detection is paused until S3 becomes reachable again.
 	ConditionMonarchS3Unreachable = "MonarchS3Unreachable"
+	// ConditionAgentPlanStuck surfaces a failing automation-agent plan step on at least one member.
+	// Set with reason ReasonAgentPlanError and a message containing the process name and the agent's
+	// error string; cleared once every member reaches its goal state.
+	ConditionAgentPlanStuck = "AgentPlanStuck"
 )
 
 // Monarch condition reasons
@@ -101,6 +105,8 @@ const (
 	ReasonMonarchDeploymentReady   = "DeploymentReady"
 	ReasonMonarchDeploymentPending = "DeploymentPending"
 	ReasonMonarchDeploymentFailed  = "DeploymentFailed"
+	// ReasonAgentPlanError is set on ConditionAgentPlanStuck when the agent reports a plan execution failure.
+	ReasonAgentPlanError = "PlanExecutionError"
 	// Failover reasons
 	ReasonFailoverStarted         = "FailoverStarted"
 	ReasonFailoverWaitingForAgent = "WaitingForAgent"
