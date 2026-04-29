@@ -12,13 +12,10 @@ import (
 
 	mdbv1 "github.com/mongodb/mongodb-kubernetes/api/v1/mdb"
 	"github.com/mongodb/mongodb-kubernetes/pkg/kube"
+	monarchpkg "github.com/mongodb/mongodb-kubernetes/pkg/monarch"
 )
 
 const (
-	monarchHealthPort      int32 = 8080
-	monarchReplicationPort int32 = 9995
-	monarchAPIPort         int32 = 1122
-
 	defaultMonarchImage = "268558157000.dkr.ecr.us-east-1.amazonaws.com/staging/mongodb-kubernetes-monarch-injector:latest"
 
 	// DefaultMonarchReplicas is the default number of Monarch instances (shippers or injectors).
@@ -144,7 +141,7 @@ bindIp: "0.0.0.0"
 port: %d
 healthApiEndpoint: "0.0.0.0:%d"
 monarchApiEndpoint: "0.0.0.0:%d"
-`, monarchReplicationPort, monarchHealthPort, monarchAPIPort)
+`, monarchpkg.ReplicationPort, monarchpkg.HealthPort, monarchpkg.APIPort)
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -213,6 +210,12 @@ func BuildMonarchDeployment(mdb *mdbv1.MongoDB, namespace string) *appsv1.Deploy
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: labels,
+					// checksum/config is initialized empty and overwritten by the reconciler's
+					// CreateOrUpdate mutate callback. Declaring it here ensures it is present
+					// from the very first create, not only on subsequent updates.
+					Annotations: map[string]string{
+						"checksum/config": "",
+					},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -221,15 +224,15 @@ func BuildMonarchDeployment(mdb *mdbv1.MongoDB, namespace string) *appsv1.Deploy
 							Image:   monarchImage(spec),
 							Command: command,
 							Ports: []corev1.ContainerPort{
-								{Name: "health", ContainerPort: monarchHealthPort, Protocol: corev1.ProtocolTCP},
-								{Name: "replication", ContainerPort: monarchReplicationPort, Protocol: corev1.ProtocolTCP},
-								{Name: "monarch-api", ContainerPort: monarchAPIPort, Protocol: corev1.ProtocolTCP},
+								{Name: "health", ContainerPort: monarchpkg.HealthPort, Protocol: corev1.ProtocolTCP},
+								{Name: "replication", ContainerPort: monarchpkg.ReplicationPort, Protocol: corev1.ProtocolTCP},
+								{Name: "monarch-api", ContainerPort: monarchpkg.APIPort, Protocol: corev1.ProtocolTCP},
 							},
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
 										Path: "/api/v1/status",
-										Port: intstr.FromInt32(monarchHealthPort),
+										Port: intstr.FromInt32(monarchpkg.HealthPort),
 									},
 								},
 								InitialDelaySeconds: 5,
@@ -280,9 +283,9 @@ func BuildMonarchService(mdb *mdbv1.MongoDB, namespace string) *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			Selector: labels,
 			Ports: []corev1.ServicePort{
-				{Name: "health", Port: monarchHealthPort, TargetPort: intstr.FromInt32(monarchHealthPort), Protocol: corev1.ProtocolTCP},
-				{Name: "replication", Port: monarchReplicationPort, TargetPort: intstr.FromInt32(monarchReplicationPort), Protocol: corev1.ProtocolTCP},
-				{Name: "monarch-api", Port: monarchAPIPort, TargetPort: intstr.FromInt32(monarchAPIPort), Protocol: corev1.ProtocolTCP},
+				{Name: "health", Port: monarchpkg.HealthPort, TargetPort: intstr.FromInt32(monarchpkg.HealthPort), Protocol: corev1.ProtocolTCP},
+				{Name: "replication", Port: monarchpkg.ReplicationPort, TargetPort: intstr.FromInt32(monarchpkg.ReplicationPort), Protocol: corev1.ProtocolTCP},
+				{Name: "monarch-api", Port: monarchpkg.APIPort, TargetPort: intstr.FromInt32(monarchpkg.APIPort), Protocol: corev1.ProtocolTCP},
 			},
 		},
 	}

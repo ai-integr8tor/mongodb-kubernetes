@@ -91,6 +91,9 @@ const (
 	// This can happen during unplanned failover when an external tool (CLI) writes to S3 directly.
 	// The operator follows S3 for infrastructure but preserves user's spec (K8s convention).
 	ConditionSpecOutOfSync = "SpecOutOfSync"
+	// ConditionMonarchS3Unreachable indicates the operator cannot read the Monarch S3 DR state file.
+	// Failover detection is paused until S3 becomes reachable again.
+	ConditionMonarchS3Unreachable = "MonarchS3Unreachable"
 )
 
 // Monarch condition reasons
@@ -111,13 +114,12 @@ const (
 type FailoverPhase string
 
 const (
-	FailoverPhaseIdle               FailoverPhase = "Idle"
-	FailoverPhaseWaitingForAgent    FailoverPhase = "WaitingForAgent"
+	FailoverPhaseIdle                   FailoverPhase = "Idle"
+	FailoverPhaseWaitingForAgent        FailoverPhase = "WaitingForAgent"
 	FailoverPhaseSwappingInfrastructure FailoverPhase = "SwappingInfrastructure"
-	FailoverPhaseComplete           FailoverPhase = "Complete"
-	FailoverPhaseFailed             FailoverPhase = "Failed"
+	FailoverPhaseComplete               FailoverPhase = "Complete"
+	FailoverPhaseFailed                 FailoverPhase = "Failed"
 )
-
 
 // MonarchSpec configures Monarch disaster recovery for this MongoDB cluster.
 //
@@ -150,7 +152,7 @@ type MonarchSpec struct {
 	S3 MonarchS3Config `json:"s3"`
 
 	// Image is the Monarch container image to use (e.g., "quay.io/mongodb/monarch:0.1.1").
-	// This must include the full image path and tag.
+	// Must include the full image path and tag.
 	Image string `json:"image"`
 }
 

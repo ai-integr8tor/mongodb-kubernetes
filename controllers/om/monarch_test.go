@@ -23,13 +23,13 @@ func TestSetMaintainedMonarchComponents(t *testing.T) {
 			AWSRegion:          "us-east-1",
 			AWSAccessKeyID:     "AKID",
 			AWSSecretAccessKey: "SECRET",
-			InjectorConfig: InjectorConfig{
+			InjectorConfig: &InjectorConfig{
 				Version: "0.1.1",
-				Shards: []InjectorShard{
+				Shards: []MonarchShard{
 					{
 						ShardID:     "0",
 						ReplSetName: "standby-rs",
-						Instances: []InjectorInstance{
+						Instances: []MonarchInstance{
 							{
 								ID:                 0,
 								Hostname:           "localhost",
@@ -110,14 +110,10 @@ func newMonarchMDB(role mdbv1.MonarchRole) *mdbv1.MongoDB {
 
 func TestBuildMaintainedMonarchComponents_Standby(t *testing.T) {
 	mdb := newMonarchMDB(mdbv1.MonarchRoleStandby)
-	memberHostnames := []string{
-		"my-rs-0.my-rs-svc.ns.svc.cluster.local",
-		"my-rs-1.my-rs-svc.ns.svc.cluster.local",
-		"my-rs-2.my-rs-svc.ns.svc.cluster.local",
-	}
 	serviceDNS := "my-rs-monarch-injector-svc.ns.svc.cluster.local"
+	mongoURI := "mongodb://my-rs-0.my-rs-svc.ns.svc.cluster.local:27017"
 
-	result, err := BuildMaintainedMonarchComponents(mdb, "standby-rs", "AKID", "SECRET", memberHostnames, serviceDNS)
+	result, err := BuildMaintainedMonarchComponents(mdb, "standby-rs", "AKID", "SECRET", serviceDNS, mongoURI)
 	require.NoError(t, err)
 	require.Len(t, result, 1)
 
@@ -132,19 +128,22 @@ func TestBuildMaintainedMonarchComponents_Standby(t *testing.T) {
 	assert.Equal(t, "http://minio:9000", mc.S3BucketEndpoint)
 	assert.True(t, mc.S3PathStyleAccess)
 
+	require.NotNil(t, mc.InjectorConfig)
 	assert.Equal(t, "0.1.1", mc.InjectorConfig.Version)
+	assert.Equal(t, mongoURI, mc.InjectorConfig.SrcURI)
 	require.Len(t, mc.InjectorConfig.Shards, 1)
 
 	shard := mc.InjectorConfig.Shards[0]
 	assert.Equal(t, "0", shard.ShardID)
 	assert.Equal(t, "standby-rs", shard.ReplSetName)
-	// In MCK, we have ONE injector instance pointing to the shared Service DNS.
-	// The K8s Service load-balances to multiple injector pods.
+	// Single instance pointing at the K8s Service DNS.
+	// ExternallyManaged=true + MonarchApiEndpoint set: agent routes directly to the
+	// service and skips hostname locality checks (see mms-automation injectorclient.go).
 	require.Len(t, shard.Instances, 1)
 
 	inst := shard.Instances[0]
 	assert.Equal(t, 0, inst.ID)
-	assert.Equal(t, serviceDNS, inst.Hostname) // Uses Service DNS, not RS pod FQDN
+	assert.Equal(t, serviceDNS, inst.Hostname)
 	assert.Equal(t, 9995, inst.Port)
 	assert.True(t, inst.ExternallyManaged)
 	assert.Equal(t, serviceDNS+":8080", inst.HealthAPIEndpoint)
@@ -153,20 +152,21 @@ func TestBuildMaintainedMonarchComponents_Standby(t *testing.T) {
 
 func TestBuildMaintainedMonarchComponents_Active(t *testing.T) {
 	mdb := newMonarchMDB(mdbv1.MonarchRoleActive)
-	memberHostnames := []string{
-		"my-rs-0.my-rs-svc.ns.svc.cluster.local",
-	}
 	serviceDNS := "my-rs-monarch-shipper-svc.ns.svc.cluster.local"
+	mongoURI := "mongodb://my-rs-0.my-rs-svc.ns.svc.cluster.local:27017"
 
-	result, err := BuildMaintainedMonarchComponents(mdb, "active-rs", "AKID", "SECRET", memberHostnames, serviceDNS)
+	result, err := BuildMaintainedMonarchComponents(mdb, "active-rs", "AKID", "SECRET", serviceDNS, mongoURI)
 	require.NoError(t, err)
 	require.Len(t, result, 1)
 
 	mc := result[0]
 	assert.Equal(t, "active-rs", mc.ReplicaSetID)
-	assert.Equal(t, "0.1.1", mc.InjectorConfig.Version)
-	// Active clusters have no injector instances.
-	assert.Empty(t, mc.InjectorConfig.Shards)
+	require.NotNil(t, mc.ShipperConfig)
+	assert.Equal(t, monarchShipperMode, mc.ShipperConfig.Mode)
+	assert.Equal(t, mongoURI, mc.ShipperConfig.BackupMongoNodeURI)
+	assert.Len(t, mc.ShipperConfig.Shards, 1)
+	// Active clusters have no injector config.
+	assert.Nil(t, mc.InjectorConfig)
 }
 
 func TestBuildMaintainedMonarchComponents_NilMonarch(t *testing.T) {
@@ -175,6 +175,6 @@ func TestBuildMaintainedMonarchComponents_NilMonarch(t *testing.T) {
 		Spec:       mdbv1.MongoDbSpec{Members: 3},
 	}
 
-	_, err := BuildMaintainedMonarchComponents(mdb, "rs", "AKID", "SECRET", nil, "")
+	_, err := BuildMaintainedMonarchComponents(mdb, "rs", "AKID", "SECRET", "", "")
 	require.Error(t, err)
 }

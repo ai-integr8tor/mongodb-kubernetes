@@ -16,7 +16,6 @@ Flow:
 """
 
 import os
-import subprocess
 import time
 
 import boto3
@@ -26,6 +25,7 @@ from kubernetes import client as k8s_client
 from pytest import fixture, mark
 
 from kubetester import create_or_update_secret, try_load
+from kubetester.create_or_replace_from_yaml import create_or_replace_from_yaml
 from kubetester.kubetester import KubernetesTester
 from kubetester.kubetester import fixture as yaml_fixture
 from kubetester.mongodb import MongoDB
@@ -51,6 +51,7 @@ S3_CREDS_SECRET = "monarch-s3-creds"
 _STAGING_ECR = "268558157000.dkr.ecr.us-east-1.amazonaws.com/staging"
 OM_IMAGE = os.getenv("MDB_OM_IMAGE", f"{_STAGING_ECR}/mongodb-enterprise-ops-manager-ubi:monarch")
 MONARCH_IMAGE = os.getenv("MDB_MONARCH_IMAGE", f"{_STAGING_ECR}/mongodb-kubernetes-monarch-injector:monarch")
+AGENT_IMAGE = os.getenv("MDB_AGENT_IMAGE", f"{_STAGING_ECR}/mongodb-agent:monarch")
 
 # ── test data ───────────────────────────────────────────────────────────────
 PRODUCTS_DB = "products"
@@ -174,8 +175,26 @@ def ops_manager(namespace: str, custom_mdb_version: str, custom_appdb_version: s
 
 @fixture(scope="module")
 def minio(namespace: str) -> str:
-    subprocess.check_call(["kubectl", "apply", "-n", namespace, "-f", yaml_fixture("minio.yaml")])
-    _wait_for_deployment_ready(namespace, MINIO_NAME)
+    """Deploy MinIO if not already running, then ensure the bucket exists.
+
+    Uses create_or_replace_from_yaml (python equivalent of kubectl apply) so the
+    fixture is idempotent — safe to re-run on test restart without redeploying
+    a healthy MinIO instance.
+    """
+    apps = k8s_client.AppsV1Api()
+    try:
+        dep = apps.read_namespaced_deployment(MINIO_NAME, namespace)
+        already_ready = dep.status.ready_replicas and dep.status.ready_replicas >= 1
+    except k8s_client.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+        already_ready = False
+
+    if not already_ready:
+        api_client = k8s_client.ApiClient()
+        create_or_replace_from_yaml(api_client, yaml_fixture("minio.yaml"), namespace=namespace)
+        _wait_for_deployment_ready(namespace, MINIO_NAME)
+
     _ensure_s3_bucket(namespace)
     return _minio_endpoint(namespace)
 
@@ -195,6 +214,10 @@ def active_rs(namespace: str, custom_mdb_version: str, ops_manager: MongoDBOpsMa
     resource = MongoDB.from_yaml(yaml_fixture("replica-set-monarch.yaml"), ACTIVE_RS_NAME, namespace)
     resource.set_version(custom_mdb_version)
     resource.configure(ops_manager, ACTIVE_RS_NAME)
+    resource["metadata"].setdefault("annotations", {})["mongodb.com/v1.architecture"] = "static"
+    resource["spec"]["podSpec"] = {
+        "podTemplate": {"spec": {"containers": [{"name": "mongodb-agent", "image": AGENT_IMAGE}]}}
+    }
     try_load(resource)
     return resource
 
@@ -211,11 +234,12 @@ def standby_rs(
     _wait_for_s3_data(namespace)
     resource = MongoDB.from_yaml(yaml_fixture("replica-set-monarch.yaml"), STANDBY_RS_NAME, namespace)
     resource.set_version(custom_mdb_version)
-    resource["spec"]["monarch"] = _monarch_spec(
-        namespace,
-        "standby",
-    )
+    resource["spec"]["monarch"] = _monarch_spec(namespace, "standby")
     resource.configure(ops_manager, STANDBY_RS_NAME)
+    resource["metadata"].setdefault("annotations", {})["mongodb.com/v1.architecture"] = "static"
+    resource["spec"]["podSpec"] = {
+        "podTemplate": {"spec": {"containers": [{"name": "mongodb-agent", "image": AGENT_IMAGE}]}}
+    }
     try_load(resource)
     return resource
 
@@ -273,7 +297,19 @@ class TestMonarchShipper(KubernetesTester):
         assert mc[0]["awsBucketName"] == S3_BUCKET
         assert mc[0]["clusterPrefix"] == CLUSTER_PREFIX
         assert mc[0]["initialMode"] == "ACTIVE"
-        assert mc[0]["injectorConfig"]["shards"] == []
+
+        # Active clusters have shipperConfig with the shipper Service endpoint.
+        svc_dns = f"{ACTIVE_RS_NAME}-monarch-shipper-svc.{self.namespace}.svc.cluster.local"
+        shipper_shards = mc[0]["shipperConfig"]["shards"]
+        assert len(shipper_shards) == 1
+        inst = shipper_shards[0]["instances"][0]
+        assert inst["hostname"] == svc_dns
+        assert inst["healthApiEndpoint"] == f"{svc_dns}:8080"
+        assert inst["monarchApiEndpoint"] == f"{svc_dns}:1122"
+        assert inst["externallyManaged"] is True
+
+        # injectorConfig is omitted for active clusters (pointer field with omitempty).
+        assert "injectorConfig" not in mc[0]
 
     def test_shipper_uploads_to_s3(self, active_rs: MongoDB):
         """Verify shipper is uploading oplog data to S3."""
@@ -309,26 +345,35 @@ class TestMonarchInjector(KubernetesTester):
         """
         standby_rs.update()
         standby_rs.assert_reaches_phase(Phase.Running, timeout=600)
-        _wait_for_monarch_condition(standby_rs)
+        _wait_for_monarch_condition(standby_rs) # <-- TODO: a recent changeset broke this
 
     def test_standby_automation_config(self, standby_rs: MongoDB):
-        """Verify automation config has InjectorInstances for each RS member."""
+        """Verify automation config has a single InjectorInstance pointing at the K8s Service.
+
+        The injector runs as a Deployment behind a Service. ExternallyManaged=true tells
+        the agent not to manage the injector lifecycle. MonarchApiEndpoint routes traffic
+        through the Service (bypassing hostname locality matching), so a single instance
+        is sufficient — the Service load-balances across injector pods.
+        """
         config = standby_rs.get_automation_config_tester().automation_config
         mc = config["maintainedMonarchComponents"]
-        # replicaSetId is the local RS name; DR pair linkage is via shared clusterPrefix
         assert mc[0]["replicaSetId"] == STANDBY_RS_NAME
+        assert mc[0]["initialMode"] == "STANDBY"
 
         instances = mc[0]["injectorConfig"]["shards"][0]["instances"]
-        members = standby_rs["spec"]["members"]
-        assert len(instances) == members
+        assert len(instances) == 1
 
         svc_dns = f"{STANDBY_RS_NAME}-monarch-injector-svc.{self.namespace}.svc.cluster.local"
-        for i, inst in enumerate(instances):
-            expected_host = f"{STANDBY_RS_NAME}-{i}.{STANDBY_RS_NAME}-svc.{self.namespace}.svc.cluster.local"
-            assert inst["hostname"] == expected_host
-            assert inst["healthApiEndpoint"] == f"{svc_dns}:8080"
-            assert inst["monarchApiEndpoint"] == f"{svc_dns}:1122"
-            assert inst["externallyManaged"] is True
+        inst = instances[0]
+        assert inst["hostname"] == svc_dns
+        assert inst["healthApiEndpoint"] == f"{svc_dns}:8080"
+        assert inst["monarchApiEndpoint"] == f"{svc_dns}:1122"
+        assert inst["externallyManaged"] is True
+
+        # shipperConfig is omitted for standby clusters (pointer field with omitempty).
+        # Setting mode on an empty ShipperConfig would trigger OM's backupMongoNodeURI
+        # validation even when there are no shards to ship.
+        assert "shipperConfig" not in mc[0]
 
     def test_documents_replicated_to_standby(self, standby_rs: MongoDB):
         """Verify documents from active cluster are replicated to standby."""
@@ -360,12 +405,11 @@ class TestMonarchPromotion(KubernetesTester):
 
         This triggers the promotion state machine:
         1. Operator writes PromoteStandby to S3
-        2. Agent sees PromoteStandby, completes RS reconfig, writes StandbyReadyToPromote
-        3. Operator sees StandbyReadyToPromote, deletes injector, creates shipper
-        4. Operator writes Active to S3
+        2. Agent sees PromoteStandby, applies pre-baked AC patches, elects primary,
+           writes Active to S3
+        3. Operator sees Active in S3, deletes injector, creates shipper
         """
         standby_rs["spec"]["monarch"]["role"] = "active"
-        standby_rs["spec"]["monarch"].pop("source", None)
         standby_rs.update()
 
     def test_failover_in_progress_condition(self, standby_rs: MongoDB):

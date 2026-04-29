@@ -747,8 +747,9 @@ func TestMongoDB_MonarchConfigRequired(t *testing.T) {
 			monarch: &MonarchSpec{
 				Role: MonarchRoleActive,
 				S3: MonarchS3Config{
-					Bucket: "bucket",
-					Region: "us-east-1",
+					Bucket:               "bucket",
+					Region:               "us-east-1",
+					CredentialsSecretRef: corev1.LocalObjectReference{Name: "creds"},
 				},
 			},
 			expectError: true,
@@ -779,9 +780,22 @@ func TestMongoDB_MonarchConfigRequired(t *testing.T) {
 			errorMsg:    "spec.monarch.s3.region is required",
 		},
 		{
-			name: "Valid config",
+			name: "Valid active config",
 			monarch: &MonarchSpec{
 				Role:  MonarchRoleActive,
+				Image: "quay.io/mongodb/monarch:0.1.1",
+				S3: MonarchS3Config{
+					Bucket:               "bucket",
+					Region:               "us-east-1",
+					CredentialsSecretRef: corev1.LocalObjectReference{Name: "creds"},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "Valid standby config",
+			monarch: &MonarchSpec{
+				Role:  MonarchRoleStandby,
 				Image: "quay.io/mongodb/monarch:0.1.1",
 				S3: MonarchS3Config{
 					Bucket:               "bucket",

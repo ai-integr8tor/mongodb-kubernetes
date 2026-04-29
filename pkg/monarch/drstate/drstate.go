@@ -183,7 +183,8 @@ func (c *Client) Write(ctx context.Context, state DRState, expectedETag string) 
 	if err != nil {
 		// Check for CAS failure (ETag mismatch) using proper AWS SDK error types
 		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+		if errors.As(err, &apiErr) &&
+			(apiErr.ErrorCode() == "PreconditionFailed" || apiErr.ErrorCode() == "ConditionalRequestConflict") {
 			return "", ErrCASConflict
 		}
 		return "", fmt.Errorf("failed to write DR state to S3: %w", err)

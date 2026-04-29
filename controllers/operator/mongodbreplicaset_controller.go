@@ -4,18 +4,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
-	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -41,6 +40,7 @@ import (
 	"github.com/mongodb/mongodb-kubernetes/controllers/operator/agents"
 	"github.com/mongodb/mongodb-kubernetes/controllers/operator/certs"
 	"github.com/mongodb/mongodb-kubernetes/controllers/operator/connection"
+	"github.com/mongodb/mongodb-kubernetes/controllers/operator/connectionstring"
 	"github.com/mongodb/mongodb-kubernetes/controllers/operator/construct"
 	"github.com/mongodb/mongodb-kubernetes/controllers/operator/controlledfeature"
 	"github.com/mongodb/mongodb-kubernetes/controllers/operator/create"
@@ -69,7 +69,6 @@ import (
 	"github.com/mongodb/mongodb-kubernetes/pkg/util/maputil"
 	"github.com/mongodb/mongodb-kubernetes/pkg/vault"
 	"github.com/mongodb/mongodb-kubernetes/pkg/vault/vaultwatcher"
-	"k8s.io/utils/ptr"
 )
 
 // ReconcileMongoDbReplicaSet reconciles a MongoDB with a type of ReplicaSet.
@@ -301,7 +300,20 @@ func (r *ReplicaSetReconcilerHelper) Reconcile(ctx context.Context) (reconcile.R
 		}
 	}
 
-	// 5. Actual reconciliation execution, Ops Manager and kubernetes resources update
+	// 5a. Monarch K8s resources (ConfigMap, Service, Deployment).
+	// Created BEFORE the AC push so the injector/shipper Service exists when
+	// agents first poll the AC. The maintainedMonarchComponents payload is
+	// pushed atomically with RS processes inside updateOmDeploymentRs below —
+	// this is what enables the greenfield standby provisioning path (agents
+	// never see a "plain RS" AC, so they take InitializeStandbyRsConfig on
+	// first poll instead of initializing a regular RS).
+	if rs.Spec.Monarch != nil {
+		if monarchStatus := r.reconcileMonarchResources(ctx); !monarchStatus.IsOK() {
+			return r.updateStatus(ctx, monarchStatus)
+		}
+	}
+
+	// 5b. Ops Manager AC push and StatefulSet creation.
 	publishAutomationConfigFirst := publishAutomationConfigFirstRS(ctx, reconciler.client, *rs, r.deploymentState.LastAchievedSpec, deploymentOpts.currentAgentAuthMode, projectConfig.SSLMMSCAConfigMap, log)
 	status := workflow.RunInGivenOrder(publishAutomationConfigFirst,
 		func() workflow.Status {
@@ -313,20 +325,6 @@ func (r *ReplicaSetReconcilerHelper) Reconcile(ctx context.Context) (reconcile.R
 
 	if !status.IsOK() {
 		return r.updateStatus(ctx, status)
-	}
-
-	// === 5b. Monarch reconciliation (Deployments, Services, and automation config)
-	if rs.Spec.Monarch != nil {
-		if monarchStatus := r.reconcileMonarch(ctx, conn); !monarchStatus.IsOK() {
-			return r.updateStatus(ctx, monarchStatus)
-		}
-	} else {
-		// Monarch was removed — clean up K8s resources.
-		if cleanupStatus := r.cleanupMonarchResources(ctx); !cleanupStatus.IsOK() {
-			return r.updateStatus(ctx, cleanupStatus)
-		}
-		apimeta.RemoveStatusCondition(&rs.Status.Conditions, mdbv1.ConditionShipperReady)
-		apimeta.RemoveStatusCondition(&rs.Status.Conditions, mdbv1.ConditionInjectorReady)
 	}
 
 	// === 6. Final steps
@@ -409,7 +407,7 @@ func (r *ReconcileMongoDbReplicaSet) Reconcile(ctx context.Context, request reco
 	rs := &mdbv1.MongoDB{}
 
 	if reconcileResult, err := r.prepareResourceForReconciliation(ctx, request, rs, log); err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			return workflow.Invalid("Object for reconciliation not found").ReconcileResult()
 		}
 		return reconcileResult, err
@@ -429,7 +427,7 @@ func publishAutomationConfigFirstRS(ctx context.Context, getter kubernetesClient
 	namespacedName := kube.ObjectKey(mdb.Namespace, mdb.Name)
 	currentSts, err := getter.GetStatefulSet(ctx, namespacedName)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			// No need to publish state as this is a new StatefulSet
 			log.Debugf("New StatefulSet %s", namespacedName)
 			return false
@@ -503,7 +501,7 @@ func (r *ReplicaSetReconcilerHelper) reconcileHostnameOverrideConfigMap(ctx cont
 
 	cm := getHostnameOverrideConfigMapForReplicaset(r.resource)
 	err := configmap.CreateOrUpdate(ctx, getUpdateCreator, cm)
-	if err != nil && !errors.IsAlreadyExists(err) {
+	if err != nil && !k8serrors.IsAlreadyExists(err) {
 		return xerrors.Errorf("failed to create configmap: %s, err: %w", cm.Name, err)
 	}
 	log.Infof("Successfully ensured configmap: %s", cm.Name)
@@ -532,14 +530,15 @@ func (r *ReplicaSetReconcilerHelper) reconcileMemberResources(ctx context.Contex
 	return r.reconcileStatefulSet(ctx, conn, projectConfig, deploymentOptions)
 }
 
-// reconcileMonarch ensures Monarch ConfigMap, Deployment, Service, and automation config are up to date.
-// Order: ConfigMap → Service → Deployment → wait for ready → push automation config.
-// This ordering ensures agents only see InjectorInstances when the injector is already healthy,
-// eliminating the race where agents block in WaitForInjectorReady on an unhealthy service.
+// reconcileMonarchResources ensures Monarch ConfigMap, Service, and Deployment exist.
+// It owns Kubernetes resources only; the automation config push (including
+// maintainedMonarchComponents) happens atomically in updateOmDeploymentRs so the
+// agent sees the full standby goal state on its first AC poll.
 //
-// If a role change is detected (active ↔ standby), this function delegates to reconcileMonarchFailover
-// to handle the failover state machine before proceeding with normal reconciliation.
-func (r *ReplicaSetReconcilerHelper) reconcileMonarch(ctx context.Context, conn om.Connection) workflow.Status {
+// If a role change is detected (active ↔ standby), this function delegates to
+// reconcileMonarchFailover to handle the failover state machine before creating
+// the new role's K8s resources.
+func (r *ReplicaSetReconcilerHelper) reconcileMonarchResources(ctx context.Context) workflow.Status {
 	rs := r.resource
 	reconciler := r.reconciler
 	log := r.log
@@ -559,7 +558,6 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarch(ctx context.Context, conn 
 		return status
 	}
 
-	// Determine role early for condition type and resource naming
 	conditionType := mdbv1.ConditionInjectorReady
 	monarchRole := "injector"
 	if rs.Spec.Monarch.Role == mdbv1.MonarchRoleActive {
@@ -568,18 +566,21 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarch(ctx context.Context, conn 
 	}
 	role := string(rs.Spec.Monarch.Role)
 
-	// 0. Read AWS credentials early (fail fast if secret doesn't exist)
-	credSecret, err := reconciler.client.GetSecret(ctx, kube.ObjectKey(rs.Namespace, rs.Spec.Monarch.S3.CredentialsSecretRef.Name))
-	if err != nil {
+	// Fail fast if credentials secret doesn't exist; values are consumed by the Deployment and by buildMonarchComponentsForAC.
+	if _, err := reconciler.client.GetSecret(ctx, kube.ObjectKey(rs.Namespace, rs.Spec.Monarch.S3.CredentialsSecretRef.Name)); err != nil {
 		return workflow.Failed(xerrors.Errorf("failed to read Monarch credentials secret %s: %w", rs.Spec.Monarch.S3.CredentialsSecretRef.Name, err))
 	}
-	awsKeyId := string(credSecret.Data["awsAccessKeyId"])
-	awsSecret := string(credSecret.Data["awsSecretAccessKey"])
 
-	// Build MongoDB connection string for the replica set
-	srcURI := buildMongoDBConnectionString(rs)
+	srcURI := connectionstring.Builder().
+		SetName(rs.Name).
+		SetNamespace(rs.Namespace).
+		SetReplicas(rs.Spec.Members).
+		SetService(rs.ServiceName()).
+		SetIsReplicaSet(true).
+		SetIsTLSEnabled(rs.Spec.IsSecurityTLSConfigEnabled()).
+		SetClusterDomain(rs.Spec.GetClusterDomain()).
+		Build()
 
-	// 1. Create or update Monarch ConfigMap (contains YAML config)
 	cm := construct.BuildMonarchConfigMap(rs, rs.Namespace, srcURI)
 	if _, err := controllerutil.CreateOrUpdate(ctx, reconciler.client, cm, func() error {
 		fresh := construct.BuildMonarchConfigMap(rs, rs.Namespace, srcURI)
@@ -590,7 +591,7 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarch(ctx context.Context, conn 
 		return workflow.Failed(xerrors.Errorf("failed to create/update Monarch ConfigMap %s: %w", cm.Name, err))
 	}
 
-	// 2. Create or update Monarch Service (before Deployment so DNS is resolvable)
+	// Service must exist before Deployment so DNS is resolvable
 	svc := construct.BuildMonarchService(rs, rs.Namespace)
 	if _, err := controllerutil.CreateOrUpdate(ctx, reconciler.client, svc, func() error {
 		fresh := construct.BuildMonarchService(rs, rs.Namespace)
@@ -602,10 +603,9 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarch(ctx context.Context, conn 
 		return workflow.Failed(xerrors.Errorf("failed to create/update Monarch Service %s: %w", svc.Name, err))
 	}
 
-	// Hash the ConfigMap content so pod template annotation changes trigger a rolling restart
+	// Hash triggers rolling restart when config changes
 	configHash := monarchConfigHash(cm.Data)
 
-	// 3. Create or update Monarch Deployment
 	dep := construct.BuildMonarchDeployment(rs, rs.Namespace)
 	if _, err := controllerutil.CreateOrUpdate(ctx, reconciler.client, dep, func() error {
 		fresh := construct.BuildMonarchDeployment(rs, rs.Namespace)
@@ -626,115 +626,49 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarch(ctx context.Context, conn 
 		return workflow.Failed(xerrors.Errorf("failed to create/update Monarch Deployment %s: %w", dep.Name, err))
 	}
 
-	// 4. Wait for at least one Deployment replica to be ready before pushing automation config.
-	// This ensures agents only see InjectorInstances when the health endpoint is already serving.
-	if err := waitForMonarchDeploymentReady(ctx, reconciler.client, dep, 120*time.Second); err != nil {
-		apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
-			Type:    conditionType,
-			Status:  metav1.ConditionFalse,
-			Reason:  mdbv1.ReasonMonarchDeploymentPending,
-			Message: fmt.Sprintf("Waiting for Deployment: %v", err),
-		})
-		return workflow.Pending("Waiting for Monarch %s Deployment to be ready: %v", monarchRole, err)
-	}
-
-	// 5. Build automation config with InjectorInstances pointing to the now-healthy Service
-	serviceDNS := construct.GetMonarchServiceDNS(rs.Name, monarchRole, rs.Namespace)
-	memberSvcName := rs.ServiceName()
-	memberHostnames := make([]string, rs.Spec.Members)
-	for i := 0; i < rs.Spec.Members; i++ {
-		memberHostnames[i] = fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", rs.Name, i, memberSvcName, rs.Namespace)
-	}
-	mc, err := om.BuildMaintainedMonarchComponents(rs, rs.Name, awsKeyId, awsSecret, memberHostnames, serviceDNS)
-	if err != nil {
-		return workflow.Failed(xerrors.Errorf("failed to build Monarch automation config: %w", err))
-	}
-
-	// 7. Push automation config — agents will see InjectorInstances pointing to a healthy service
-	err = conn.ReadUpdateDeployment(
-		func(d om.Deployment) error {
-			d.SetMaintainedMonarchComponents(mc)
-			return nil
-		},
-		log,
-	)
-	if err != nil {
-		apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
-			Type:    conditionType,
-			Status:  metav1.ConditionFalse,
-			Reason:  mdbv1.ReasonMonarchDeploymentFailed,
-			Message: fmt.Sprintf("Failed to push automation config: %v", err),
-		})
-		return workflow.Failed(xerrors.Errorf("failed to update automation config with Monarch components: %w", err))
-	}
-
-	// 8. Update condition to reflect final ready state
 	apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
 		Type:    conditionType,
 		Status:  metav1.ConditionTrue,
 		Reason:  mdbv1.ReasonMonarchDeploymentReady,
-		Message: fmt.Sprintf("%d/%d pods ready (role=%s)", dep.Status.ReadyReplicas, ptr.Deref(dep.Spec.Replicas, 1), role),
+		Message: fmt.Sprintf("Monarch %s Deployment reconciled (role=%s)", monarchRole, role),
 	})
-	log.Infof("Reconciled Monarch %s with %d replicas", monarchRole, construct.DefaultMonarchReplicas)
+	log.Infof("Reconciled Monarch %s K8s resources", monarchRole)
 	return workflow.OK()
 }
 
-// cleanupMonarchResources deletes Monarch Deployment, Service, and ConfigMap when spec.monarch is removed.
-func (r *ReplicaSetReconcilerHelper) cleanupMonarchResources(ctx context.Context) workflow.Status {
+// buildMonarchComponentsForAC builds the maintainedMonarchComponents payload for
+// the atomic AC push in updateOmDeploymentRs. Returns nil when spec.monarch is unset.
+func (r *ReplicaSetReconcilerHelper) buildMonarchComponentsForAC(ctx context.Context) ([]om.MaintainedMonarchComponents, error) {
 	rs := r.resource
 	reconciler := r.reconciler
-	log := r.log
-
-	// Delete both shipper and injector resources since we don't know which role was previously active.
-	// OwnerReferences should handle this, but explicit cleanup ensures resources are removed
-	// even if the owner reference chain is broken.
-	for _, role := range []string{"shipper", "injector"} {
-		// Delete Deployment
-		dep := &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      construct.MonarchDeploymentName(rs.Name, role),
-				Namespace: rs.Namespace,
-			},
-		}
-		if err := reconciler.client.Delete(ctx, dep); err != nil && !errors.IsNotFound(err) {
-			return workflow.Failed(xerrors.Errorf("failed to delete Monarch %s Deployment: %w", role, err))
-		}
-
-		// Delete Service
-		svc := &corev1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      construct.MonarchServiceName(rs.Name, role),
-				Namespace: rs.Namespace,
-			},
-		}
-		if err := reconciler.client.Delete(ctx, svc); err != nil && !errors.IsNotFound(err) {
-			return workflow.Failed(xerrors.Errorf("failed to delete Monarch %s Service: %w", role, err))
-		}
-
-		// Delete ConfigMap
-		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      construct.MonarchConfigMapName(rs.Name, role),
-				Namespace: rs.Namespace,
-			},
-		}
-		if err := reconciler.client.Delete(ctx, cm); err != nil && !errors.IsNotFound(err) {
-			return workflow.Failed(xerrors.Errorf("failed to delete Monarch %s ConfigMap: %w", role, err))
-		}
+	if rs.Spec.Monarch == nil {
+		return nil, nil
 	}
 
-	log.Info("Cleaned up Monarch K8s resources")
-	return workflow.OK()
-}
+	credSecret, err := reconciler.client.GetSecret(ctx, kube.ObjectKey(rs.Namespace, rs.Spec.Monarch.S3.CredentialsSecretRef.Name))
+	if err != nil {
+		return nil, xerrors.Errorf("failed to read Monarch credentials secret %s: %w", rs.Spec.Monarch.S3.CredentialsSecretRef.Name, err)
+	}
 
-// waitForMonarchDeploymentReady polls until at least one Deployment replica is ready.
-func waitForMonarchDeploymentReady(ctx context.Context, c client.Client, dep *appsv1.Deployment, timeout time.Duration) error {
-	return wait.PollUntilContextTimeout(ctx, 3*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
-		if err := c.Get(ctx, types.NamespacedName{Name: dep.Name, Namespace: dep.Namespace}, dep); err != nil {
-			return false, err
-		}
-		return dep.Status.ReadyReplicas > 0, nil
-	})
+	monarchRole := "injector"
+	if rs.Spec.Monarch.Role == mdbv1.MonarchRoleActive {
+		monarchRole = "shipper"
+	}
+	serviceDNS := construct.GetMonarchServiceDNS(rs.Name, monarchRole, rs.Namespace)
+	srcURI := connectionstring.Builder().
+		SetName(rs.Name).
+		SetNamespace(rs.Namespace).
+		SetReplicas(rs.Spec.Members).
+		SetService(rs.ServiceName()).
+		SetIsReplicaSet(true).
+		SetIsTLSEnabled(rs.Spec.IsSecurityTLSConfigEnabled()).
+		SetClusterDomain(rs.Spec.GetClusterDomain()).
+		Build()
+
+	return om.BuildMaintainedMonarchComponents(rs, rs.Name,
+		string(credSecret.Data["awsAccessKeyId"]),
+		string(credSecret.Data["awsSecretAccessKey"]),
+		serviceDNS, srcURI)
 }
 
 // detectMonarchRoleChange checks if the Monarch role has changed from the last achieved spec.
@@ -748,12 +682,10 @@ func (r *ReplicaSetReconcilerHelper) detectMonarchRoleChange() *mdbv1.MonarchRol
 		return nil
 	}
 
-	// First Monarch deployment - not a role change, just initial setup
 	if lastSpec == nil || lastSpec.Monarch == nil {
-		return nil
+		return nil // First Monarch deployment, not a role change
 	}
 
-	// Compare current role with last achieved role
 	if lastSpec.Monarch.Role != rs.Spec.Monarch.Role {
 		return &lastSpec.Monarch.Role
 	}
@@ -771,16 +703,14 @@ func isInitialMonarchSetup(rs *mdbv1.MongoDB, lastSpec *mdbv1.MongoDbSpec) bool 
 	return lastSpec == nil || lastSpec.Monarch == nil
 }
 
-// AnnotationFailoverS3ETag stores the S3 ETag for CAS operations during failover.
-const AnnotationFailoverS3ETag = "mongodb.com/failover-s3-etag"
-
 // reconcileMonarchFailover handles the failover state machine when a role change is detected.
-// It coordinates with the agent via S3: writes PromoteStandby, polls for StandbyReadyToPromote,
-// swaps infrastructure (delete old deployment, create new), then writes Active state.
 //
-// State transitions (operator writes):
-//   - Standby → Active: Write PromoteStandby → Poll for StandbyReadyToPromote → Swap infra → Write Active
-//   - Active → Standby: Stop shipper → Create injector → Write Standby
+// Promotion (standby → active): The operator writes PromoteStandby to S3 to trigger the agent.
+// The agent then autonomously applies pre-baked AC patches, elects a primary, and writes Active
+// to S3. The operator polls for Active, then swaps K8s infrastructure.
+//
+// Demotion (active → standby): The operator deletes the shipper and writes Standby to S3.
+// Normal reconciliation then creates injector resources.
 func (r *ReplicaSetReconcilerHelper) reconcileMonarchFailover(ctx context.Context, previousRole mdbv1.MonarchRole) workflow.Status {
 	rs := r.resource
 	log := r.log
@@ -791,11 +721,15 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarchFailover(ctx context.Contex
 		"newRole", newRole,
 	)
 
-	// Initialize failover state if not already tracking
-	if rs.Status.FailoverPhase == "" || rs.Status.FailoverPhase == mdbv1.FailoverPhaseIdle || rs.Status.FailoverPhase == mdbv1.FailoverPhaseComplete {
+	// Initialize failover state if not already tracking.
+	// FailoverPhaseFailed is also reset here so that a failed failover auto-retries
+	// from the beginning when the user re-triggers by changing the role again.
+	if rs.Status.FailoverPhase == "" ||
+		rs.Status.FailoverPhase == mdbv1.FailoverPhaseIdle ||
+		rs.Status.FailoverPhase == mdbv1.FailoverPhaseComplete ||
+		rs.Status.FailoverPhase == mdbv1.FailoverPhaseFailed {
 		rs.Status.FailoverPhase = mdbv1.FailoverPhaseWaitingForAgent
 
-		// Set FailoverInProgress condition (contains timestamp and message)
 		apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
 			Type:    mdbv1.ConditionFailoverInProgress,
 			Status:  metav1.ConditionTrue,
@@ -804,7 +738,6 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarchFailover(ctx context.Contex
 		})
 	}
 
-	// Handle based on transition direction
 	if newRole == mdbv1.MonarchRoleActive {
 		return r.promoteToActive(ctx)
 	}
@@ -812,17 +745,25 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarchFailover(ctx context.Contex
 }
 
 // promoteToActive handles the standby → active promotion workflow.
-// Phase 1: Write PromoteStandby to S3 (triggers agent)
-// Phase 2: Poll S3 for StandbyReadyToPromote (agent completed RS reconfig)
-// Phase 3: Swap infrastructure (delete injector, create shipper)
-// Phase 4: Write Active to S3, complete failover
+//
+// The agent owns the full promotion sequence autonomously after PromoteStandby is written:
+//   - Agent detects PromoteStandby, coordinates with injector (StopReplicating + IsClusterStabilized)
+//   - Agent applies pre-baked standbyModifications patches from the automation config
+//   - Agent elects a primary, then writes Active to S3 via UpdateStandbyStatus action
+//
+// Operator flow:
+//
+//	Phase WaitingForAgent:
+//	  1. Write PromoteStandby to S3 (triggers agent)
+//	  2. Poll S3 until state == Active (agent drives the entire promotion)
+//	Phase SwappingInfrastructure:
+//	  3. Swap K8s infrastructure (delete injector, create shipper)
 func (r *ReplicaSetReconcilerHelper) promoteToActive(ctx context.Context) workflow.Status {
 	rs := r.resource
 	log := r.log
 
 	log.Infow("Promotion to active", "phase", rs.Status.FailoverPhase)
 
-	// Create DR state client
 	drClient, err := r.createDRStateClient(ctx)
 	if err != nil {
 		r.setFailoverFailed("Failed to create DR state client: %v", err)
@@ -831,103 +772,66 @@ func (r *ReplicaSetReconcilerHelper) promoteToActive(ctx context.Context) workfl
 
 	switch rs.Status.FailoverPhase {
 	case mdbv1.FailoverPhaseWaitingForAgent:
-		// Check if we've already written PromoteStandby (indicated by annotation)
-		if rs.Annotations[AnnotationFailoverS3ETag] == "" {
-			// Phase 1: Write PromoteStandby to S3 to trigger agent
-			log.Info("Writing PromoteStandby state to S3")
-
-			clusterID := fmt.Sprintf("%s/%s", rs.Namespace, rs.Name)
-			result, err := drClient.TransitionTo(ctx, drstate.StatePromoteStandby, clusterID)
-			if err != nil {
-				if err == drstate.ErrCASConflict {
-					log.Warn("CAS conflict writing PromoteStandby, will retry")
-					return workflow.Pending("CAS conflict writing PromoteStandby, retrying")
-				}
-				r.setFailoverFailed("Failed to write PromoteStandby to S3: %v", err)
-				return workflow.Failed(xerrors.Errorf("failed to write PromoteStandby to S3: %w", err))
-			}
-
-			// Store the ETag in annotation for CAS operations
-			if rs.Annotations == nil {
-				rs.Annotations = make(map[string]string)
-			}
-			rs.Annotations[AnnotationFailoverS3ETag] = result.ETag
-
-			apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
-				Type:    mdbv1.ConditionFailoverInProgress,
-				Status:  metav1.ConditionTrue,
-				Reason:  mdbv1.ReasonFailoverWaitingForAgent,
-				Message: "Wrote PromoteStandby to S3, waiting for agent to complete RS reconfiguration",
-			})
-
-			log.Info("Wrote PromoteStandby to S3, waiting for agent response")
-			return workflow.Pending("Waiting for agent to complete RS reconfiguration")
-		}
-
-		// Phase 2: Poll S3 for StandbyReadyToPromote
-		log.Info("Polling S3 for StandbyReadyToPromote state")
-
 		currentState, err := drClient.Read(ctx)
 		if err != nil {
 			log.Warnw("Failed to read DR state from S3", "error", err)
 			return workflow.Pending("Failed to read DR state, retrying")
 		}
 
-		if currentState == nil {
-			log.Warn("DR state file not found in S3")
-			return workflow.Pending("DR state file not found, retrying")
-		}
-
-		log.Infow("Current DR state", "state", currentState.State)
-
-		if currentState.State == drstate.StateStandbyReadyToPromote {
-			// Agent has completed RS reconfiguration, proceed to infrastructure swap
-			log.Info("Agent completed RS reconfiguration, proceeding to infrastructure swap")
-			rs.Status.FailoverPhase = mdbv1.FailoverPhaseSwappingInfrastructure
-
+		// Only write PromoteStandby when the cluster is still in a pre-promotion state.
+		// If S3 already shows PromoteStandby or later, the agent is already in progress.
+		if currentState == nil || currentState.State == drstate.StateStandby {
+			log.Info("Writing PromoteStandby state to S3 to trigger agent")
+			if _, err := drClient.TransitionTo(ctx, drstate.StatePromoteStandby, r.clusterID()); err != nil {
+				if stderrors.Is(err, drstate.ErrCASConflict) {
+					return r.handleCASConflict("writing PromoteStandby")
+				}
+				r.setFailoverFailed("Failed to write PromoteStandby to S3: %v", err)
+				return workflow.Failed(xerrors.Errorf("failed to write PromoteStandby to S3: %w", err))
+			}
+			log.Info("Wrote PromoteStandby to S3, waiting for agent to complete promotion and write Active")
 			apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
 				Type:    mdbv1.ConditionFailoverInProgress,
 				Status:  metav1.ConditionTrue,
-				Reason:  mdbv1.ReasonFailoverSwappingInfra,
-				Message: "Agent completed RS reconfiguration, swapping infrastructure",
+				Reason:  mdbv1.ReasonFailoverWaitingForAgent,
+				Message: "Waiting for agent to complete RS reconfiguration and write Active to S3",
 			})
-			// Fall through to SwappingInfrastructure phase
-		} else {
-			return workflow.Pending("Waiting for agent to complete RS reconfiguration (current state: %s)", currentState.State)
+			return workflow.Pending("Waiting for agent to complete promotion")
 		}
+
+		if currentState.State != drstate.StateActive {
+			apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
+				Type:    mdbv1.ConditionFailoverInProgress,
+				Status:  metav1.ConditionTrue,
+				Reason:  mdbv1.ReasonFailoverWaitingForAgent,
+				Message: "Waiting for agent to complete RS reconfiguration and write Active to S3",
+			})
+			return workflow.Pending("Waiting for agent to write Active to S3 (current state: %s)", currentState.State)
+		}
+
+		// Agent wrote Active — advance phase and fall through to swap infrastructure.
+		log.Info("Agent wrote Active to S3, proceeding to infrastructure swap")
+		rs.Status.FailoverPhase = mdbv1.FailoverPhaseSwappingInfrastructure
+		apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
+			Type:    mdbv1.ConditionFailoverInProgress,
+			Status:  metav1.ConditionTrue,
+			Reason:  mdbv1.ReasonFailoverSwappingInfra,
+			Message: "Agent completed promotion and wrote Active to S3, swapping K8s infrastructure",
+		})
 		fallthrough
 
 	case mdbv1.FailoverPhaseSwappingInfrastructure:
-		// Phase 3: Swap infrastructure (delete injector, create shipper)
-		log.Info("Swapping infrastructure from injector to shipper")
+		log.Info("Swapping K8s infrastructure from injector to shipper")
 
 		if status := r.deleteMonarchResourcesForRole(ctx, "injector"); !status.IsOK() {
 			r.setFailoverFailed("Failed to delete injector: %v", status)
 			return status
 		}
 
-		log.Info("Deleted injector resources")
-
-		// Phase 4: Write Active state to S3
-		log.Info("Writing Active state to S3")
-		clusterID := fmt.Sprintf("%s/%s", rs.Namespace, rs.Name)
-		_, err := drClient.TransitionTo(ctx, drstate.StateActive, clusterID)
-		if err != nil {
-			if err == drstate.ErrCASConflict {
-				log.Warn("CAS conflict writing Active state, will retry")
-				return workflow.Pending("CAS conflict writing Active state, retrying")
-			}
-			// Log but don't fail - the infrastructure swap is complete
-			log.Warnw("Failed to write Active state to S3, continuing anyway", "error", err)
-		}
-
-		// Mark failover as complete
 		r.setFailoverComplete("Successfully promoted to active")
-
-		// Remove old InjectorReady condition since we're now active
 		apimeta.RemoveStatusCondition(&rs.Status.Conditions, mdbv1.ConditionInjectorReady)
 
-		log.Info("Promotion to active complete")
+		log.Info("Promotion to active complete — K8s infrastructure swapped")
 		return workflow.OK()
 
 	default:
@@ -947,7 +851,6 @@ func (r *ReplicaSetReconcilerHelper) demoteToStandby(ctx context.Context) workfl
 
 	log.Infow("Demotion to standby", "phase", rs.Status.FailoverPhase)
 
-	// Create DR state client
 	drClient, err := r.createDRStateClient(ctx)
 	if err != nil {
 		r.setFailoverFailed("Failed to create DR state client: %v", err)
@@ -961,7 +864,6 @@ func (r *ReplicaSetReconcilerHelper) demoteToStandby(ctx context.Context) workfl
 		fallthrough
 
 	case mdbv1.FailoverPhaseSwappingInfrastructure:
-		// Phase 1: Delete shipper resources
 		log.Info("Deleting shipper resources")
 
 		if status := r.deleteMonarchResourcesForRole(ctx, "shipper"); !status.IsOK() {
@@ -969,25 +871,17 @@ func (r *ReplicaSetReconcilerHelper) demoteToStandby(ctx context.Context) workfl
 			return status
 		}
 
-		log.Info("Deleted shipper resources")
-
-		// Phase 2: Write Standby state to S3
 		log.Info("Writing Standby state to S3")
-		clusterID := fmt.Sprintf("%s/%s", rs.Namespace, rs.Name)
-		_, err := drClient.TransitionTo(ctx, drstate.StateStandby, clusterID)
+		_, err := drClient.TransitionTo(ctx, drstate.StateStandby, r.clusterID())
 		if err != nil {
-			if err == drstate.ErrCASConflict {
-				log.Warn("CAS conflict writing Standby state, will retry")
-				return workflow.Pending("CAS conflict writing Standby state, retrying")
+			if stderrors.Is(err, drstate.ErrCASConflict) {
+				return r.handleCASConflict("writing Standby state")
 			}
-			// Log but don't fail - the infrastructure swap is complete
+			// Log but don't fail - infrastructure swap is complete, S3 state is best-effort
 			log.Warnw("Failed to write Standby state to S3, continuing anyway", "error", err)
 		}
 
-		// Mark failover as complete
 		r.setFailoverComplete("Successfully demoted to standby")
-
-		// Remove old ShipperReady condition since we're now standby
 		apimeta.RemoveStatusCondition(&rs.Status.Conditions, mdbv1.ConditionShipperReady)
 
 		log.Info("Demotion to standby complete")
@@ -1004,7 +898,6 @@ func (r *ReplicaSetReconcilerHelper) demoteToStandby(ctx context.Context) workfl
 func (r *ReplicaSetReconcilerHelper) setFailoverFailed(format string, args ...interface{}) {
 	rs := r.resource
 	rs.Status.FailoverPhase = mdbv1.FailoverPhaseFailed
-	delete(rs.Annotations, AnnotationFailoverS3ETag)
 
 	apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
 		Type:    mdbv1.ConditionFailoverInProgress,
@@ -1018,7 +911,6 @@ func (r *ReplicaSetReconcilerHelper) setFailoverFailed(format string, args ...in
 func (r *ReplicaSetReconcilerHelper) setFailoverComplete(message string) {
 	rs := r.resource
 	rs.Status.FailoverPhase = mdbv1.FailoverPhaseComplete
-	delete(rs.Annotations, AnnotationFailoverS3ETag)
 
 	apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
 		Type:    mdbv1.ConditionFailoverInProgress,
@@ -1033,6 +925,17 @@ func (r *ReplicaSetReconcilerHelper) setFailoverComplete(message string) {
 		Reason:  mdbv1.ReasonFailoverSucceeded,
 		Message: message,
 	})
+}
+
+// clusterID returns the cluster identifier used for S3 DR state operations.
+func (r *ReplicaSetReconcilerHelper) clusterID() string {
+	return r.resource.ObjectKey().String()
+}
+
+// handleCASConflict logs and returns a pending status for S3 CAS conflicts.
+func (r *ReplicaSetReconcilerHelper) handleCASConflict(operation string) workflow.Status {
+	r.log.Warnf("CAS conflict %s, will retry", operation)
+	return workflow.Pending("CAS conflict %s, retrying", operation)
 }
 
 // reconcileMonarchS3State reads the S3 DR state on every reconcile and handles unplanned failover.
@@ -1050,15 +953,11 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarchS3State(ctx context.Context
 	rs := r.resource
 	log := r.log
 
-	// Active clusters don't monitor S3 state - they only have shipper, no injector config.
-	// Only standby clusters read the S3 DR state file to detect unplanned failover.
 	if rs.Spec.Monarch.Role == mdbv1.MonarchRoleActive {
-		log.Debug("Active cluster, skipping S3 state check (only standby monitors S3)")
-		return workflow.OK()
+		return workflow.OK() // Active clusters don't monitor S3 state
 	}
 
-	// Skip S3 state check if a failover is already in progress (triggered by CR change).
-	// The failover state machine handles S3 coordination during planned failover.
+	// Skip if planned failover in progress - the state machine handles S3 coordination
 	if rs.Status.FailoverPhase != "" &&
 		rs.Status.FailoverPhase != mdbv1.FailoverPhaseIdle &&
 		rs.Status.FailoverPhase != mdbv1.FailoverPhaseComplete {
@@ -1066,23 +965,33 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarchS3State(ctx context.Context
 		return workflow.OK()
 	}
 
-	// Create DR state client
 	drClient, err := r.createDRStateClient(ctx)
 	if err != nil {
-		// Log but don't fail - S3 state reading is best-effort for unplanned failover detection.
-		// The cluster should continue operating even if S3 is unreachable.
+		apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
+			Type:    mdbv1.ConditionMonarchS3Unreachable,
+			Status:  metav1.ConditionTrue,
+			Reason:  "ClientCreationFailed",
+			Message: fmt.Sprintf("Cannot reach Monarch S3 bucket — failover detection paused: %v", err),
+		})
 		log.Warnw("Failed to create DR state client, skipping S3 state check", "error", err)
 		return workflow.OK()
 	}
 
-	// Read S3 DR state
 	s3State, err := drClient.Read(ctx)
 	if err != nil {
+		apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
+			Type:    mdbv1.ConditionMonarchS3Unreachable,
+			Status:  metav1.ConditionTrue,
+			Reason:  "ReadFailed",
+			Message: fmt.Sprintf("Cannot read Monarch S3 DR state file — failover detection paused: %v", err),
+		})
 		log.Warnw("Failed to read DR state from S3", "error", err)
 		return workflow.OK()
 	}
 
-	// Update status.Monarch with observed S3 state
+	// S3 is reachable — clear any previous unreachable condition
+	apimeta.RemoveStatusCondition(&rs.Status.Conditions, mdbv1.ConditionMonarchS3Unreachable)
+
 	now := metav1.Now()
 	if rs.Status.Monarch == nil {
 		rs.Status.Monarch = &mdbv1.MonarchStatus{}
@@ -1115,11 +1024,11 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarchS3State(ctx context.Context
 
 		// Handle unplanned failover: S3 shows promotion completed but CR still says standby
 		if s3ExpectsActive && !crSpecActive {
-			return r.handleUnplannedPromotion(ctx, s3State.State)
+			return r.handleUnplannedPromotion(ctx, s3State.State, drClient)
 		}
 
 		// S3 shows standby but CR says active (demotion scenario)
-		// OUT OF SCOPE: Demotion is not designed yet - just set warning condition
+		// TODO: OUT OF SCOPE: Demotion is not designed yet - just set warning condition
 		apimeta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{
 			Type:    mdbv1.ConditionSpecOutOfSync,
 			Status:  metav1.ConditionTrue,
@@ -1137,7 +1046,8 @@ func (r *ReplicaSetReconcilerHelper) reconcileMonarchS3State(ctx context.Context
 // handleUnplannedPromotion handles the case where S3 shows the cluster should be active
 // but the CR spec still says standby. This happens during unplanned failover when an
 // external tool (CLI) writes to S3 directly.
-func (r *ReplicaSetReconcilerHelper) handleUnplannedPromotion(ctx context.Context, s3State drstate.State) workflow.Status {
+// drClient is passed in from the caller to avoid a redundant client construction.
+func (r *ReplicaSetReconcilerHelper) handleUnplannedPromotion(ctx context.Context, s3State drstate.State, drClient *drstate.Client) workflow.Status {
 	rs := r.resource
 	log := r.log
 
@@ -1160,18 +1070,11 @@ func (r *ReplicaSetReconcilerHelper) handleUnplannedPromotion(ctx context.Contex
 		}
 
 		// Write Active state to S3 to complete the promotion
-		drClient, err := r.createDRStateClient(ctx)
-		if err != nil {
-			log.Warnw("Failed to create DR state client for S3 write", "error", err)
-		} else {
-			clusterID := fmt.Sprintf("%s/%s", rs.Namespace, rs.Name)
-			if _, err := drClient.TransitionTo(ctx, drstate.StateActive, clusterID); err != nil {
-				if err == drstate.ErrCASConflict {
-					log.Warn("CAS conflict writing Active state (unplanned), will retry")
-					return workflow.Pending("CAS conflict writing Active state, retrying")
-				}
-				log.Warnw("Failed to write Active state to S3 (unplanned)", "error", err)
+		if _, err := drClient.TransitionTo(ctx, drstate.StateActive, r.clusterID()); err != nil {
+			if stderrors.Is(err, drstate.ErrCASConflict) {
+				return r.handleCASConflict("writing Active state (unplanned)")
 			}
+			log.Warnw("Failed to write Active state to S3 (unplanned)", "error", err)
 		}
 	}
 
@@ -1196,19 +1099,21 @@ func (r *ReplicaSetReconcilerHelper) handleUnplannedPromotion(ctx context.Contex
 
 	// Update status to reflect the actual state
 	now := metav1.Now()
+	if rs.Status.Monarch == nil {
+		rs.Status.Monarch = &mdbv1.MonarchStatus{}
+	}
 	rs.Status.Monarch.ObservedS3State = string(s3State)
 	rs.Status.Monarch.ObservedS3StateTime = &now
 
 	// Remove InjectorReady since we're transitioning to active
 	apimeta.RemoveStatusCondition(&rs.Status.Conditions, mdbv1.ConditionInjectorReady)
 
-	// Continue with normal reconciliation - shipper will be created because
-	// we look at S3 state (Active) not CR spec (standby).
-	// The SpecOutOfSync condition tells the user to update their CR.
-	log.Info("Unplanned promotion handled, shipper will be created by normal reconciliation")
+	// The shipper will only be created once the user updates spec.monarch.role to "active".
+	// The operator preserves the CR spec (K8s convention); the SpecOutOfSync condition
+	// informs the user of the discrepancy.
+	log.Info("Unplanned promotion: waiting for user to update spec.monarch.role to active")
 
-	// Return pending to trigger another reconcile that creates the shipper
-	return workflow.Pending("Unplanned promotion: infrastructure swap in progress")
+	return workflow.Pending("Unplanned promotion detected: update spec.monarch.role to active to acknowledge")
 }
 
 // monarchDeploymentExists checks if a Monarch Deployment exists for the given role.
@@ -1271,7 +1176,7 @@ func (r *ReplicaSetReconcilerHelper) deleteMonarchResourcesForRole(ctx context.C
 			Namespace: rs.Namespace,
 		},
 	}
-	if err := reconciler.client.Delete(ctx, dep); err != nil && !errors.IsNotFound(err) {
+	if err := reconciler.client.Delete(ctx, dep); err != nil && !k8serrors.IsNotFound(err) {
 		return workflow.Failed(xerrors.Errorf("failed to delete Monarch %s Deployment: %w", role, err))
 	}
 
@@ -1282,7 +1187,7 @@ func (r *ReplicaSetReconcilerHelper) deleteMonarchResourcesForRole(ctx context.C
 			Namespace: rs.Namespace,
 		},
 	}
-	if err := reconciler.client.Delete(ctx, svc); err != nil && !errors.IsNotFound(err) {
+	if err := reconciler.client.Delete(ctx, svc); err != nil && !k8serrors.IsNotFound(err) {
 		return workflow.Failed(xerrors.Errorf("failed to delete Monarch %s Service: %w", role, err))
 	}
 
@@ -1293,7 +1198,7 @@ func (r *ReplicaSetReconcilerHelper) deleteMonarchResourcesForRole(ctx context.C
 			Namespace: rs.Namespace,
 		},
 	}
-	if err := reconciler.client.Delete(ctx, cm); err != nil && !errors.IsNotFound(err) {
+	if err := reconciler.client.Delete(ctx, cm); err != nil && !k8serrors.IsNotFound(err) {
 		return workflow.Failed(xerrors.Errorf("failed to delete Monarch %s ConfigMap: %w", role, err))
 	}
 
@@ -1301,24 +1206,6 @@ func (r *ReplicaSetReconcilerHelper) deleteMonarchResourcesForRole(ctx context.C
 	return workflow.OK()
 }
 
-// buildMongoDBConnectionString builds a MongoDB connection string for the replica set.
-func buildMongoDBConnectionString(rs *mdbv1.MongoDB) string {
-	svcName := rs.ServiceName()
-	namespace := rs.Namespace
-	members := rs.Spec.Members
-	port := 27017 // default MongoDB port
-
-	// Build host list: <rs>-0.<svc>.<ns>.svc.cluster.local:27017,...
-	hosts := ""
-	for i := 0; i < members; i++ {
-		if i > 0 {
-			hosts += ","
-		}
-		hosts += fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:%d", rs.Name, i, svcName, namespace, port)
-	}
-
-	return fmt.Sprintf("mongodb://%s/?replicaSet=%s", hosts, rs.Name)
-}
 
 func (r *ReplicaSetReconcilerHelper) reconcileStatefulSet(ctx context.Context, conn om.Connection, projectConfig mdbv1.ProjectConfig, deploymentOptions deploymentOptionsRS) workflow.Status {
 	rs := r.resource
@@ -1571,6 +1458,15 @@ func (r *ReplicaSetReconcilerHelper) updateOmDeploymentRs(ctx context.Context, c
 		prometheusCertHash: deploymentOptions.prometheusCertHash,
 	}
 
+	// Build maintainedMonarchComponents so it can be pushed atomically with RS
+	// processes in the single ReadUpdateDeployment below. Splitting these into
+	// two AC writes lets agents initialize a regular RS between the writes,
+	// which the mms-automation planner cannot reconfigure into standby mode.
+	monarchMC, err := r.buildMonarchComponentsForAC(ctx)
+	if err != nil && !isRecovering {
+		return workflow.Failed(err)
+	}
+
 	err = conn.ReadUpdateDeployment(
 		func(d om.Deployment) error {
 			if shouldMirrorKeyfileForMongot {
@@ -1578,7 +1474,13 @@ func (r *ReplicaSetReconcilerHelper) updateOmDeploymentRs(ctx context.Context, c
 					return err
 				}
 			}
-			return ReconcileReplicaSetAC(ctx, d, rs.Spec.DbCommonSpec, lastRsConfig.ToMap(), rs.Name, replicaSet, caFilePath, internalClusterCertPath, &prometheusConfiguration, log)
+			if err := ReconcileReplicaSetAC(ctx, d, rs.Spec.DbCommonSpec, lastRsConfig.ToMap(), rs.Name, replicaSet, caFilePath, internalClusterCertPath, &prometheusConfiguration, log); err != nil {
+				return err
+			}
+			if monarchMC != nil {
+				d.SetMaintainedMonarchComponents(monarchMC)
+			}
+			return nil
 		},
 		log,
 	)
@@ -1655,6 +1557,11 @@ func (r *ReplicaSetReconcilerHelper) cleanOpsManagerState(ctx context.Context, r
 			// deletion cleanup happened twice and the first one cleaned OM state already)
 			if e := d.RemoveReplicaSetByName(rs.Name, log); e != nil {
 				log.Warnf("Failed to remove replica set from automation config: %s", e)
+			}
+			// Remove Monarch components so the agent stops trying to reach deleted endpoints.
+			// Only needed when Monarch was configured on this CR.
+			if rs.Spec.Monarch != nil {
+				delete(d, "maintainedMonarchComponents")
 			}
 
 			return nil

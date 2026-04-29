@@ -5,36 +5,39 @@ import (
 	"strings"
 
 	mdbv1 "github.com/mongodb/mongodb-kubernetes/api/v1/mdb"
+	monarchpkg "github.com/mongodb/mongodb-kubernetes/pkg/monarch"
 )
 
 // MaintainedMonarchComponents is the automation config section that tells the agent
-// about the Monarch injector configuration for a standby cluster.
+// about the Monarch shipper/injector configuration for a cluster.
 type MaintainedMonarchComponents struct {
-	ReplicaSetID       string         `json:"replicaSetId"`
-	ClusterPrefix      string         `json:"clusterPrefix"`
-	InitialMode        string         `json:"initialMode"`
-	AWSBucketName      string         `json:"awsBucketName"`
-	AWSRegion          string         `json:"awsRegion"`
-	AWSAccessKeyID     string         `json:"awsAccessKeyId"`
-	AWSSecretAccessKey string         `json:"awsSecretAccessKey"`
-	S3BucketEndpoint   string         `json:"s3BucketEndPoint,omitempty"`
-	S3PathStyleAccess  bool           `json:"s3PathStyleAccess,omitempty"`
-	InjectorConfig     InjectorConfig `json:"injectorConfig"`
+	ReplicaSetID       string `json:"replicaSetId"`
+	ClusterPrefix      string `json:"clusterPrefix"`
+	InitialMode        string `json:"initialMode"`
+	AWSBucketName      string `json:"awsBucketName"`
+	AWSRegion          string `json:"awsRegion"`
+	AWSAccessKeyID     string `json:"awsAccessKeyId"`
+	AWSSecretAccessKey string `json:"awsSecretAccessKey"`
+	S3BucketEndpoint   string `json:"s3BucketEndPoint,omitempty"`
+	S3PathStyleAccess  bool   `json:"s3PathStyleAccess,omitempty"`
+	// InjectorConfig is populated for standby clusters (role: standby).
+	InjectorConfig *InjectorConfig `json:"injectorConfig,omitempty"`
+	// ShipperConfig is populated for active clusters (role: active).
+	ShipperConfig *ShipperConfig `json:"shipperConfig,omitempty"`
 }
 
-type InjectorConfig struct {
-	Version string          `json:"version"`
-	SrcURI  string          `json:"srcURI,omitempty"`
-	Shards  []InjectorShard `json:"shards"`
+// MonarchShard is a shard entry used by both ShipperConfig and InjectorConfig.
+type MonarchShard struct {
+	ShardID     string            `json:"shardId"`
+	ReplSetName string            `json:"replSetName"`
+	Instances   []MonarchInstance `json:"instances"`
 }
 
-type InjectorShard struct {
-	ShardID     string             `json:"shardId"`
-	ReplSetName string             `json:"replSetName"`
-	Instances   []InjectorInstance `json:"instances"`
-}
-
-type InjectorInstance struct {
+// MonarchInstance describes a single shipper or injector pod endpoint.
+// ExternallyManaged=true tells the agent not to manage the process lifecycle.
+// When HealthAPIEndpoint/MonarchAPIEndpoint are set the agent routes through
+// them directly, bypassing hostname locality matching.
+type MonarchInstance struct {
 	ID                 int    `json:"id"`
 	Hostname           string `json:"hostname"`
 	Disabled           bool   `json:"disabled"`
@@ -44,30 +47,47 @@ type InjectorInstance struct {
 	MonarchAPIEndpoint string `json:"monarchApiEndpoint"`
 }
 
+// monarchShipperMode is the only valid value for ShipperConfig.Mode per ops-manager validation.
+const monarchShipperMode = "shipperAndSnapshotter"
+
+type ShipperConfig struct {
+	Version            string         `json:"version"`
+	Mode               string         `json:"mode,omitempty"`
+	BackupMongoNodeURI string         `json:"backupMongoNodeURI,omitempty"`
+	Shards             []MonarchShard `json:"shards"`
+}
+
+type InjectorConfig struct {
+	Version string         `json:"version"`
+	SrcURI  string         `json:"srcURI,omitempty"`
+	Shards  []MonarchShard `json:"shards"`
+}
+
 // SetMaintainedMonarchComponents sets the maintainedMonarchComponents field in the automation config.
 func (d Deployment) SetMaintainedMonarchComponents(mc []MaintainedMonarchComponents) {
 	d["maintainedMonarchComponents"] = mc
 }
 
 // BuildMaintainedMonarchComponents builds the automation config entries for Monarch.
-// For standby (injector) clusters, it creates one InjectorInstance per RS member.
-// Each instance uses the member's FQDN as Hostname (for agent locality matching) but
-// routes healthApiEndpoint and monarchApiEndpoint through the shared Service.
-// For active (shipper) clusters, it creates entries without injector instances.
-func BuildMaintainedMonarchComponents(mdb *mdbv1.MongoDB, rsName string, awsAccessKeyId string, awsSecretAccessKey string, memberHostnames []string, serviceDNS string) ([]MaintainedMonarchComponents, error) {
+//
+// Both shipper (active) and injector (standby) run as separate Deployments behind a K8s
+// Service. serviceDNS is the in-cluster DNS of that Service.
+//
+// ExternallyManaged=true tells the agent not to manage the process lifecycle.
+// When MonarchApiEndpoint/HealthApiEndpoint are set, the agent routes through them
+// directly, bypassing hostname locality matching (mms-automation/standby/injectorclient.go).
+// A single instance per shard is sufficient because the Service load-balances across pods.
+func BuildMaintainedMonarchComponents(mdb *mdbv1.MongoDB, rsName string, awsAccessKeyId string, awsSecretAccessKey string, serviceDNS string, mongoURI string) ([]MaintainedMonarchComponents, error) {
 	monarch := mdb.Spec.Monarch
 	if monarch == nil {
 		return nil, fmt.Errorf("monarch spec is nil")
 	}
 
-	// InitialMode: "ACTIVE" for active clusters, "STANDBY" for standby clusters
 	initialMode := "STANDBY"
 	if monarch.Role == mdbv1.MonarchRoleActive {
 		initialMode = "ACTIVE"
 	}
 
-	// ReplicaSetID is the local RS name. Active and standby clusters in a DR pair
-	// are linked via the shared s3.prefix (ClusterPrefix), not via ReplicaSetID.
 	mc := MaintainedMonarchComponents{
 		ReplicaSetID:       rsName,
 		ClusterPrefix:      monarch.S3.GetPrefix(rsName),
@@ -80,44 +100,36 @@ func BuildMaintainedMonarchComponents(mdb *mdbv1.MongoDB, rsName string, awsAcce
 		S3PathStyleAccess:  monarch.S3.PathStyle,
 	}
 
-	// Extract version from image tag (e.g., "quay.io/mongodb/monarch:0.1.1" -> "0.1.1")
 	version := extractVersionFromImage(monarch.Image)
 
-	if monarch.Role == mdbv1.MonarchRoleActive {
-		// Active clusters use shipper.
-		mc.InjectorConfig = InjectorConfig{
-			Version: version,
-			Shards:  []InjectorShard{},
-		}
-	} else {
-		// Standby clusters need injector instance configuration.
-		// In MCK, the injector runs as a separate Deployment behind a shared K8s Service.
-		// Unlike the EA setup (where one injector runs on each mongod host), we have a
-		// single Service endpoint that load-balances to injector pods.
-		//
-		// We create ONE injector instance pointing to the Service DNS. MongoDB RS will
-		// have this single injector member added with voting rights. The K8s Service
-		// provides high availability via its pod selector.
-		instances := []InjectorInstance{
+	// Build the single instance pointing at the K8s Service.
+	shard := MonarchShard{
+		ShardID:     "0",
+		ReplSetName: rsName,
+		Instances: []MonarchInstance{
 			{
 				ID:                 0,
-				Hostname:           serviceDNS, // Use Service DNS - injector is a separate Deployment
-				Port:               9995,
+				Hostname:           serviceDNS,
+				Port:               int(monarchpkg.ReplicationPort), //nolint:gosec
 				ExternallyManaged:  true,
-				HealthAPIEndpoint:  serviceDNS + ":8080",
-				MonarchAPIEndpoint: serviceDNS + ":1122",
+				HealthAPIEndpoint:  fmt.Sprintf("%s:%d", serviceDNS, monarchpkg.HealthPort),
+				MonarchAPIEndpoint: fmt.Sprintf("%s:%d", serviceDNS, monarchpkg.APIPort),
 			},
-		}
+		},
+	}
 
-		mc.InjectorConfig = InjectorConfig{
+	if monarch.Role == mdbv1.MonarchRoleActive {
+		mc.ShipperConfig = &ShipperConfig{
+			Version:            version,
+			Mode:               monarchShipperMode,
+			BackupMongoNodeURI: mongoURI,
+			Shards:             []MonarchShard{shard},
+		}
+	} else {
+		mc.InjectorConfig = &InjectorConfig{
 			Version: version,
-			Shards: []InjectorShard{
-				{
-					ShardID:     "0",
-					ReplSetName: rsName,
-					Instances:   instances,
-				},
-			},
+			SrcURI:  mongoURI,
+			Shards:  []MonarchShard{shard},
 		}
 	}
 

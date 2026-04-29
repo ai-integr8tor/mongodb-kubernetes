@@ -890,7 +890,7 @@ spec:
                   image:
                     description: |-
                       Image is the Monarch container image to use (e.g., "quay.io/mongodb/monarch:0.1.1").
-                      This must include the full image path and tag.
+                      Must include the full image path and tag.
                     type: string
                   role:
                     description: Role determines whether this is an active (shipper)
