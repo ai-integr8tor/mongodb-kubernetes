@@ -31,7 +31,6 @@ from kubetester.mongodb import MongoDB
 from kubetester.omtester import OMContext, OMTester
 from kubetester.phase import Phase
 from pytest import fixture, mark
-
 from tests.tls.vm_migration_dry_run import run_migration_dry_run_connectivity_passes
 
 VM_STS_NAME = "vm-mongodb"
@@ -264,16 +263,16 @@ def _build_processes(vm_sts: dict, vm_service: dict, namespace: str, custom_mdb_
             mon_entry["additionalParams"] = {
                 "sslTrustedServerCertificates": CUSTOM_CA_PEM_PATH,
                 "useSslForAllConnections": "true",
-            }
+            }  # ty: ignore[invalid-assignment]
         monitoring_versions.append(mon_entry)
         net = {"port": 27017}
         if tls:
             net["tls"] = {
                 "mode": "requireTLS",
                 "certificateKeyFile": SERVER_PEM_PATH,
-            }
+            }  # ty: ignore[invalid-assignment]
         else:
-            net["tls"] = {"mode": "disabled"}
+            net["tls"] = {"mode": "disabled"}  # ty: ignore[invalid-assignment]
         process = {
             "version": custom_mdb_version,
             "name": process_name,
