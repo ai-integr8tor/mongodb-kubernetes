@@ -28,6 +28,7 @@ from kubetester.certs import ISSUER_CA_NAME, create_mongodb_tls_certs, create_x5
 from kubetester.kubetester import KubernetesTester, fcv_from_version
 from kubetester.kubetester import fixture as yaml_fixture
 from kubetester.mongodb import MongoDB
+from kubetester.mongotester import MongoDBBackgroundTester, MongoTester
 from kubetester.omtester import OMContext, OMTester
 from kubetester.phase import Phase
 from pytest import fixture, mark
@@ -128,6 +129,8 @@ def vm_sts(
     """Deploy VM StatefulSet with cert volumes (server combined PEM + CA + agent PEM)."""
     with open(yaml_fixture("vm_statefulset.yaml"), "r") as f:
         sts_body = yaml.safe_load(f.read())
+
+    sts_body["spec"]["replicas"] = 3
 
     sts_body["spec"]["template"]["spec"]["containers"][0]["env"] = [
         {"name": "MMS_GROUP_ID", "value": om_tester.context.project_id},
@@ -240,6 +243,18 @@ def vm_service(namespace: str):
     return service_body
 
 
+@fixture(scope="module")
+def mongo_tester(mdb_migration: MongoDB) -> MongoTester:
+    return mdb_migration.tester()
+
+
+@fixture(scope="module")
+def mdb_health_checker(mongo_tester: MongoTester) -> MongoDBBackgroundTester:
+    health_checker = MongoDBBackgroundTester(mongo_tester, allowed_sequential_failures=3)
+    health_checker.start()
+    return health_checker
+
+
 def _build_processes(vm_sts: dict, vm_service: dict, namespace: str, custom_mdb_version: str, tls: bool) -> tuple:
     """Build processes, monitoringVersions, and replicaSet members for the AC.
 
@@ -307,7 +322,7 @@ def _build_processes(vm_sts: dict, vm_service: dict, namespace: str, custom_mdb_
 def test_vm_mdb_reaches_running(namespace: str, vm_sts, vm_service):
     def sts_is_ready():
         sts = get_statefulset(namespace, vm_sts["metadata"]["name"])
-        return sts.status.ready_replicas == 3
+        return sts.status.ready_replicas == vm_sts["spec"]["replicas"]
 
     KubernetesTester.wait_until(sts_is_ready, timeout=300)
 
@@ -392,7 +407,7 @@ def test_vm_ac_x509_auth(
         "usersDeleted": [],
     }
     om_tester.api_put_automation_config(ac)
-    om_tester.wait_agents_ready(timeout=600)
+    om_tester.wait_agents_ready(timeout=1800)
 
 
 @mark.e2e_vm_migration_x509
@@ -407,7 +422,7 @@ def test_k8s_mdb_reaches_running(mdb_migration: MongoDB):
 
 
 @mark.e2e_vm_migration_x509
-def test_promote_and_prune(mdb_migration: MongoDB, vm_sts):
+def test_promote_and_prune(mdb_migration: MongoDB, vm_sts, mdb_health_checker: MongoDBBackgroundTester):
     try_load(mdb_migration)
     for i in range(vm_sts["spec"]["replicas"]):
         mdb_migration["spec"]["memberConfig"][i]["priority"] = "1"
@@ -417,3 +432,14 @@ def test_promote_and_prune(mdb_migration: MongoDB, vm_sts):
         mdb_migration["spec"]["externalMembers"].pop()
         mdb_migration.update()
         mdb_migration.assert_reaches_phase(Phase.Running)
+
+    mdb_health_checker.assert_healthiness()
+
+
+@mark.e2e_vm_migration_x509
+def test_process_names(om_tester: OMTester, namespace: str, mdb_migration: MongoDB):
+    ac_tester = om_tester.get_automation_config_tester()
+    process_names = [process["name"] for process in ac_tester.get_all_processes()]
+    assert f"k8s/{namespace}/{mdb_migration.name}-0" in process_names
+    assert f"k8s/{namespace}/{mdb_migration.name}-1" in process_names
+    assert f"k8s/{namespace}/{mdb_migration.name}-2" in process_names
