@@ -158,7 +158,7 @@ func buildRetryPolicy(rp *searchv1.EnvoyRetryPolicy) *routev3.RetryPolicy {
 	}
 
 	return &routev3.RetryPolicy{
-		RetryOn:       "connect-failure,refused-stream,unavailable",
+		RetryOn:       "connect-failure,refused-stream,unavailable,reset",
 		NumRetries:    wrapperspb.UInt32(numRetries),
 		PerTryTimeout: durationpb.New(perTryTimeout),
 		RetryHostPredicate: []*routev3.RetryPolicy_RetryHostPredicate{

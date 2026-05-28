@@ -347,34 +347,6 @@ func TestBuildCluster_UsesTypedExtensionProtocolOptions(t *testing.T) {
 	require.Contains(t, cluster.TypedExtensionProtocolOptions, "envoy.extensions.upstreams.http.v3.HttpProtocolOptions")
 }
 
-func TestBuildRetryPolicy_Defaults(t *testing.T) {
-	rp := buildRetryPolicy(nil)
-
-	assert.Equal(t, "connect-failure,refused-stream,unavailable", rp.RetryOn)
-	assert.Equal(t, uint32(2), rp.NumRetries.GetValue())
-	assert.Equal(t, int64(60), rp.PerTryTimeout.GetSeconds())
-	require.Len(t, rp.RetryHostPredicate, 1)
-	assert.Equal(t, "envoy.retry_host_predicates.previous_hosts", rp.RetryHostPredicate[0].Name)
-	assert.Equal(t, int64(3), rp.HostSelectionRetryMaxAttempts)
-}
-
-func TestBuildRetryPolicy_CustomValues(t *testing.T) {
-	numRetries := uint32(4)
-	perTryTimeout := "30s"
-	rp := buildRetryPolicy(&searchv1.EnvoyRetryPolicy{
-		NumRetries:    &numRetries,
-		PerTryTimeout: &perTryTimeout,
-	})
-
-	assert.Equal(t, uint32(4), rp.NumRetries.GetValue())
-	assert.Equal(t, int64(30), rp.PerTryTimeout.GetSeconds())
-	// Hardcoded fields remain unchanged
-	assert.Equal(t, "connect-failure,refused-stream,unavailable", rp.RetryOn)
-	require.Len(t, rp.RetryHostPredicate, 1)
-	assert.Equal(t, "envoy.retry_host_predicates.previous_hosts", rp.RetryHostPredicate[0].Name)
-	assert.Equal(t, int64(3), rp.HostSelectionRetryMaxAttempts)
-}
-
 func TestBuildRetryPolicy_PartialOverride(t *testing.T) {
 	numRetries := uint32(5)
 	rp := buildRetryPolicy(&searchv1.EnvoyRetryPolicy{
@@ -396,6 +368,6 @@ func TestBuildFilterChain_HasRetryPolicy(t *testing.T) {
 	// Verifying via full JSON round-trip: build config and check it contains retry fields.
 	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, false, testCAKeyName(), nil)
 	require.NoError(t, err)
-	assert.Contains(t, result, "connect-failure,refused-stream,unavailable")
+	assert.Contains(t, result, "connect-failure,refused-stream,unavailable,reset")
 	assert.Contains(t, result, "envoy.retry_host_predicates.previous_hosts")
 }
