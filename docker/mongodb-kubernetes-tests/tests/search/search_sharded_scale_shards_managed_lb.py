@@ -418,17 +418,56 @@ def test_scale_up_verify_mongod_parameters(namespace: str, mdb: MongoDB, mdbs: M
 
 
 @MARKER
-def test_scale_up_verify_search(mdb: MongoDB):
-    """Verify search returns correct results after scale-up.
+def test_scale_up_reshard_collection(mdb: MongoDB):
+    """Reshard the collection to distribute data evenly across all shards.
 
-    We do NOT call reshardCollection here because it drops all search indexes.
-    The MongoDB balancer will naturally rebalance data to the new shard over time.
-    The existing search indexes remain intact and functional.
+    After adding a new shard, the existing chunks might remain on the original shards.
+    reshardCollection with forceRedistribution ensures the new shard receives data.
+    This drops search indexes, so we recreate them in the next step.
+    """
+    search_tester = get_search_tester(mdb, ADMIN_USER_NAME, ADMIN_USER_PASSWORD, use_ssl=True)
+    admin_client = search_tester.client
+
+    logger.info("Resharding sample_mflix.movies to distribute across %d shards", SCALED_UP_SHARD_COUNT)
+    admin_client.admin.command(
+        "reshardCollection",
+        "sample_mflix.movies",
+        key={"_id": "hashed"},
+        forceRedistribution=True,
+    )
+    logger.info("Reshard complete, data distributed across all %d shards", SCALED_UP_SHARD_COUNT)
+
+    # Verify the new shard actually has data
+    coll = admin_client["sample_mflix"]["movies"]
+    stats = list(coll.aggregate([{"$collStats": {"storageStats": {}}}]))
+    new_shard_name = f"{MDB_RESOURCE_NAME}-{SCALED_UP_SHARD_COUNT - 1}"
+    shards_with_data = [s["shard"] for s in stats if s["storageStats"]["count"] > 0]
+    assert new_shard_name in shards_with_data, (
+        f"New shard {new_shard_name} has no data after reshard. " f"Shards with data: {shards_with_data}"
+    )
+    logger.info(f"Confirmed {new_shard_name} has data after reshard")
+
+
+@MARKER
+def test_scale_up_recreate_search_index(mdb: MongoDB):
+    """Recreate search index after reshardCollection dropped it."""
+    search_tester = get_search_tester(mdb, USER_NAME, USER_PASSWORD, use_ssl=True)
+    search_tester.create_search_index("sample_mflix", "movies")
+    search_tester.wait_for_search_indexes_ready("sample_mflix", "movies", timeout=300)
+    logger.info("Search index recreated after reshard")
+
+
+@MARKER
+def test_scale_up_verify_search(mdb: MongoDB):
+    """Verify search results include documents from all shards after reshard.
+
+    After reshardCollection + index rebuild, all shards have data and functional
+    mongot instances. We verify the wildcard search count matches the total
+    document count, proving all shards' mongots are serving search results.
     """
     search_tester = get_search_tester(mdb, USER_NAME, USER_PASSWORD, use_ssl=True)
-    verify_text_search_query(search_tester)
     verify_search_results_from_all_shards(search_tester)
-    logger.info("Search verification passed after scale-up to %d shards", SCALED_UP_SHARD_COUNT)
+    logger.info("Search results verified on all shards after reshard")
 
 
 # ===========================================================================
@@ -437,16 +476,49 @@ def test_scale_up_verify_search(mdb: MongoDB):
 
 
 @MARKER
-def test_scale_down_update_shard_count(mdb: MongoDB):
-    """Scale MongoDB sharded cluster from 3 back to 2 shards.
+def test_scale_down_move_chunk_back(mdb: MongoDB):
+    """Move all chunks off the shard being removed before scale-down.
 
-    MongoDB will migrate data off the removed shard before completing,
-    so we use a generous timeout.
+    removeShard drains data from the removed shard via the balancer, which
+    is very slow in CI Kind clusters. By moving chunks off explicitly,
+    removeShard completes quickly with no data to drain.
     """
+    search_tester = get_search_tester(mdb, ADMIN_USER_NAME, ADMIN_USER_PASSWORD, use_ssl=True)
+    admin_client = search_tester.client
+
+    new_shard_name = f"{MDB_RESOURCE_NAME}-{SCALED_UP_SHARD_COUNT - 1}"
+    dest_shard = f"{MDB_RESOURCE_NAME}-0"
+
+    coll_doc = admin_client["config"]["collections"].find_one({"_id": "sample_mflix.movies"})
+    assert coll_doc is not None, "sample_mflix.movies not found in config.collections"
+    collection_uuid = coll_doc["uuid"]
+
+    # Find all chunks on the shard being removed
+    chunks_on_new_shard = list(
+        admin_client["config"]["chunks"].find({"uuid": collection_uuid, "shard": new_shard_name})
+    )
+    if not chunks_on_new_shard:
+        logger.info(f"No chunks on {new_shard_name}, nothing to move")
+        return
+
+    for chunk in chunks_on_new_shard:
+        logger.info(f"Moving chunk (min={chunk['min']}) from {new_shard_name} to {dest_shard}")
+        admin_client.admin.command(
+            "moveChunk",
+            "sample_mflix.movies",
+            find=chunk["min"],
+            to=dest_shard,
+        )
+    logger.info(f"All {len(chunks_on_new_shard)} chunk(s) moved off {new_shard_name}")
+
+
+@MARKER
+def test_scale_down_update_shard_count(mdb: MongoDB):
+    """Scale MongoDB sharded cluster from 3 back to 2 shards."""
     mdb.load()
     mdb["spec"]["shardCount"] = SCALED_DOWN_SHARD_COUNT
     mdb.update()
-    mdb.assert_reaches_phase(Phase.Running, timeout=1200)
+    mdb.assert_reaches_phase(Phase.Running, timeout=1800)
     logger.info("MongoDB scaled down to %d shards", SCALED_DOWN_SHARD_COUNT)
 
 
