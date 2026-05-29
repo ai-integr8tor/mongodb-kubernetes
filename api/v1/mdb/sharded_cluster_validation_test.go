@@ -30,7 +30,7 @@ var (
 )
 
 func TestShardCountIsSpecified(t *testing.T) {
-	errString := "shardCount must be specified"
+	errString := "one of spec.shardCount or spec.shards must be specified"
 	scSingle := NewDefaultShardedClusterBuilder().Build()
 	scSingle.Spec.ShardCount = 0
 	_, err := validator.ValidateCreate(ctx, scSingle)
