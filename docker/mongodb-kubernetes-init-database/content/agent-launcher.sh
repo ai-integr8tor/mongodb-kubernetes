@@ -14,23 +14,7 @@ else
   AGENT_BINARY_PATH="/agent/mongodb-agent"
 fi
 
-export MDB_LOG_FILE_AGENT_LAUNCHER_SCRIPT="${MMS_LOG_DIR}/agent-launcher-script.log"
-
-# We start tailing script logs immediately to not miss anything.
-# -F flag is equivalent to --follow=name --retry.
-# -n0 parameter is instructing tail to show only new lines (by default tail is showing last 10 lines)
-tail -F -n0 "${MDB_LOG_FILE_AGENT_LAUNCHER_SCRIPT}" 2> /dev/null &
-
 source /opt/scripts/agent-launcher-lib.sh
-
-# all the following MDB_LOG_FILE_* env var should be defined in container's env vars
-tail -F -n0 "${MDB_LOG_FILE_AUTOMATION_AGENT_VERBOSE}" 2> /dev/null | json_log 'automation-agent-verbose' &
-tail -F -n0 "${MDB_LOG_FILE_AUTOMATION_AGENT_STDERR}" 2> /dev/null | json_log 'automation-agent-stderr' &
-tail -F -n0 "${MDB_LOG_FILE_AUTOMATION_AGENT}" 2> /dev/null | json_log 'automation-agent' &
-tail -F -n0 "${MDB_LOG_FILE_MONITORING_AGENT}" 2> /dev/null | json_log 'monitoring-agent' &
-tail -F -n0 "${MDB_LOG_FILE_BACKUP_AGENT}" 2> /dev/null | json_log 'backup-agent' &
-tail -F -n0 "${MDB_LOG_FILE_MONGODB}" 2> /dev/null | json_log 'mongodb' &
-tail -F -n0 "${MDB_LOG_FILE_MONGODB_AUDIT}" 2> /dev/null | json_log 'mongodb-audit' &
 
 # This is the directory corresponding to 'options.downloadBase' in the automation config - the directory where
 # the agent will extract MongoDB binaries to
@@ -83,13 +67,6 @@ fi
 ln -sf /journal /data/
 script_log "Created symlink: /data/journal -> $(readlink -f /data/journal)"
 
-# If it is a migration of the existing MongoDB - then there could be a mongodb.log in a default location -
-# let's try to copy it to a new directory
-if [[ -f /data/mongodb.log ]] && [[ ! -f "${MDB_LOG_FILE_MONGODB}" ]]; then
-    script_log "The mongodb log file /data/mongodb.log already exists - moving it to ${MMS_LOG_DIR}"
-    mv /data/mongodb.log "${MMS_LOG_DIR}"
-fi
-
 base_url="${BASE_URL-}" # If unassigned, set to empty string to avoid set-u errors
 base_url="${base_url%/}" # Remove any accidentally defined trailing slashes
 declare -r base_url
@@ -106,7 +83,6 @@ fi
 agentOpts=(
     "-mmsGroupId=${GROUP_ID-}"
     "-pidfilepath=${MMS_HOME}/mongodb-mms-automation-agent.pid"
-    "-maxLogFileDurationHrs=24"
     "-logLevel=${LOG_LEVEL:-INFO}"
 )
 
@@ -226,8 +202,8 @@ else
   agentOpts+=("-binariesFixedPath=${mdb_downloads_dir}/mongod/bin")
 fi
 
-# Note, that we do logging in subshell - this allows us to save the correct PID to variable (not the logging one)
-"${AGENT_BINARY_PATH}" "${agentOpts[@]}" "${splittedAgentFlags[@]}" 2>> "${MDB_LOG_FILE_AUTOMATION_AGENT_STDERR}" >> >(json_log "automation-agent-stdout") &
+# Run agent directly to stdout (no file logging, no tailing)
+"${AGENT_BINARY_PATH}" "${agentOpts[@]}" "${splittedAgentFlags[@]}" &
 
 export agentPid=$!
 script_log "Launched automation agent, pid=${agentPid}"
