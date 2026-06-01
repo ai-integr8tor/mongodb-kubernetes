@@ -39,14 +39,14 @@ func unmarshalBootstrap(t *testing.T, jsonStr string) *bootstrapv3.Bootstrap {
 }
 
 func TestBuildEnvoyConfigJSON_OutputIsValidJSON(t *testing.T) {
-	result, err := buildEnvoyConfigJSON([]envoyRoute{testRoute("mdb-sh-0")}, false, testCAKeyName())
+	result, err := buildEnvoyConfigJSON([]envoyRoute{testRoute("mdb-sh-0")}, false, testCAKeyName(), nil)
 	require.NoError(t, err)
 	assert.True(t, json.Valid([]byte(result)), "output should be valid JSON")
 }
 
 func TestBuildEnvoyConfigJSON_SingleShard_NoTLS(t *testing.T) {
 	route := testRoute("mdb-sh-0")
-	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, false, testCAKeyName())
+	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, false, testCAKeyName(), nil)
 	require.NoError(t, err)
 
 	bootstrap := unmarshalBootstrap(t, result)
@@ -109,7 +109,7 @@ func TestBuildEnvoyConfigJSON_SingleShard_NoTLS(t *testing.T) {
 func TestBuildEnvoyConfigJSON_SingleShard_WithTLS(t *testing.T) {
 	route := testRoute("mdb-sh-0")
 	caKeyName := testCAKeyName()
-	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, true, caKeyName)
+	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, true, caKeyName, nil)
 	require.NoError(t, err)
 
 	bootstrap := unmarshalBootstrap(t, result)
@@ -161,7 +161,7 @@ func TestBuildEnvoyConfigJSON_MultipleShards_WithTLS(t *testing.T) {
 	}
 
 	// Sharded clusters always require TLS for SNI-based routing
-	result, err := buildEnvoyConfigJSON(routes, true, testCAKeyName())
+	result, err := buildEnvoyConfigJSON(routes, true, testCAKeyName(), nil)
 	require.NoError(t, err)
 
 	bootstrap := unmarshalBootstrap(t, result)
@@ -198,7 +198,7 @@ func TestBuildEnvoyConfigJSON_ReplicaSet_NoTLS(t *testing.T) {
 		UpstreamPort:  27028,
 	}
 
-	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, false, testCAKeyName())
+	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, false, testCAKeyName(), nil)
 	require.NoError(t, err)
 
 	bootstrap := unmarshalBootstrap(t, result)
@@ -234,7 +234,7 @@ func TestBuildEnvoyConfigJSON_ReplicaSet_WithTLS(t *testing.T) {
 		UpstreamPort:  27028,
 	}
 
-	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, true, testCAKeyName())
+	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, true, testCAKeyName(), nil)
 	require.NoError(t, err)
 
 	bootstrap := unmarshalBootstrap(t, result)
@@ -267,7 +267,7 @@ func TestBuildEnvoyConfigJSON_ReplicaSet_WithTLS(t *testing.T) {
 
 func TestBuildFilterChain_NoTLS_NoSNIMatch(t *testing.T) {
 	route := testRoute("test-shard")
-	chain, err := buildFilterChain(route, false, testCAKeyName())
+	chain, err := buildFilterChain(route, false, testCAKeyName(), nil)
 	require.NoError(t, err)
 
 	assert.Nil(t, chain.FilterChainMatch, "no SNI match when TLS disabled")
@@ -277,7 +277,7 @@ func TestBuildFilterChain_NoTLS_NoSNIMatch(t *testing.T) {
 
 func TestBuildFilterChain_WithTLS_HasSNIMatch(t *testing.T) {
 	route := testRoute("test-shard")
-	chain, err := buildFilterChain(route, true, testCAKeyName())
+	chain, err := buildFilterChain(route, true, testCAKeyName(), nil)
 	require.NoError(t, err)
 
 	require.NotNil(t, chain.FilterChainMatch, "SNI match should be present with TLS")
@@ -287,7 +287,7 @@ func TestBuildFilterChain_WithTLS_HasSNIMatch(t *testing.T) {
 
 func TestBuildBootstrapConfig_NoTLS_NoTLSInspector(t *testing.T) {
 	route := testRoute("test-shard")
-	bootstrap, err := buildEnvoyBootstrapConfig([]envoyRoute{route}, false, testCAKeyName())
+	bootstrap, err := buildEnvoyBootstrapConfig([]envoyRoute{route}, false, testCAKeyName(), nil)
 	require.NoError(t, err)
 
 	listener := bootstrap.StaticResources.Listeners[0]
@@ -296,7 +296,7 @@ func TestBuildBootstrapConfig_NoTLS_NoTLSInspector(t *testing.T) {
 
 func TestBuildBootstrapConfig_WithTLS_HasTLSInspector(t *testing.T) {
 	route := testRoute("test-shard")
-	bootstrap, err := buildEnvoyBootstrapConfig([]envoyRoute{route}, true, testCAKeyName())
+	bootstrap, err := buildEnvoyBootstrapConfig([]envoyRoute{route}, true, testCAKeyName(), nil)
 	require.NoError(t, err)
 
 	listener := bootstrap.StaticResources.Listeners[0]
@@ -345,4 +345,29 @@ func TestBuildCluster_UsesTypedExtensionProtocolOptions(t *testing.T) {
 
 	// Verify TypedExtensionProtocolOptions is set
 	require.Contains(t, cluster.TypedExtensionProtocolOptions, "envoy.extensions.upstreams.http.v3.HttpProtocolOptions")
+}
+
+func TestBuildRetryPolicy_PartialOverride(t *testing.T) {
+	numRetries := uint32(5)
+	rp := buildRetryPolicy(&searchv1.EnvoyRetryPolicy{
+		NumRetries: &numRetries,
+		// PerTryTimeout left nil — should use default 60s
+	})
+
+	assert.Equal(t, uint32(5), rp.NumRetries.GetValue())
+	assert.Equal(t, int64(60), rp.PerTryTimeout.GetSeconds(), "should use default timeout")
+}
+
+func TestBuildFilterChain_HasRetryPolicy(t *testing.T) {
+	route := testRoute("mdb-sh-0")
+	chain, err := buildFilterChain(route, false, testCAKeyName(), nil)
+	require.NoError(t, err)
+
+	require.Len(t, chain.Filters, 1)
+	// The retry policy is embedded in the HCM → route → route action.
+	// Verifying via full JSON round-trip: build config and check it contains retry fields.
+	result, err := buildEnvoyConfigJSON([]envoyRoute{route}, false, testCAKeyName(), nil)
+	require.NoError(t, err)
+	assert.Contains(t, result, "connect-failure,refused-stream,unavailable,reset")
+	assert.Contains(t, result, "envoy.retry_host_predicates.previous_hosts")
 }
