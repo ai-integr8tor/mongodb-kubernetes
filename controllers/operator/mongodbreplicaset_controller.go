@@ -829,7 +829,7 @@ func (r *ReplicaSetReconcilerHelper) promoteToActive(ctx context.Context) workfl
 		// If S3 already shows PromoteStandby or later, the agent is already in progress.
 		if currentState == nil || currentState.State == drstate.StateStandby {
 			log.Info("Writing PromoteStandby state to S3 to trigger agent")
-			if _, err := drClient.TransitionTo(ctx, drstate.StatePromoteStandby, r.clusterID()); err != nil {
+			if _, err := drClient.TransitionTo(ctx, drstate.StatePromoteStandby); err != nil {
 				if stderrors.Is(err, drstate.ErrCASConflict) {
 					return r.handleCASConflict("writing PromoteStandby")
 				}
@@ -919,7 +919,7 @@ func (r *ReplicaSetReconcilerHelper) demoteToStandby(ctx context.Context) workfl
 		}
 
 		log.Info("Writing Standby state to S3")
-		_, err := drClient.TransitionTo(ctx, drstate.StateStandby, r.clusterID())
+		_, err := drClient.TransitionTo(ctx, drstate.StateStandby)
 		if err != nil {
 			if stderrors.Is(err, drstate.ErrCASConflict) {
 				return r.handleCASConflict("writing Standby state")
@@ -972,11 +972,6 @@ func (r *ReplicaSetReconcilerHelper) setFailoverComplete(message string) {
 		Reason:  mdbv1.ReasonFailoverSucceeded,
 		Message: message,
 	})
-}
-
-// clusterID returns the cluster identifier used for S3 DR state operations.
-func (r *ReplicaSetReconcilerHelper) clusterID() string {
-	return r.resource.ObjectKey().String()
 }
 
 // handleCASConflict logs and returns a pending status for S3 CAS conflicts.
@@ -1117,7 +1112,7 @@ func (r *ReplicaSetReconcilerHelper) handleUnplannedPromotion(ctx context.Contex
 		}
 
 		// Write Active state to S3 to complete the promotion
-		if _, err := drClient.TransitionTo(ctx, drstate.StateActive, r.clusterID()); err != nil {
+		if _, err := drClient.TransitionTo(ctx, drstate.StateActive); err != nil {
 			if stderrors.Is(err, drstate.ErrCASConflict) {
 				return r.handleCASConflict("writing Active state (unplanned)")
 			}
@@ -1199,6 +1194,7 @@ func (r *ReplicaSetReconcilerHelper) createDRStateClient(ctx context.Context) (*
 		BucketName:      s3Cfg.Bucket,
 		Region:          s3Cfg.Region,
 		ClusterPrefix:   s3Cfg.GetPrefix(rs.Name),
+		ClusterName:     rs.Name,
 		Endpoint:        s3Cfg.Endpoint,
 		PathStyleAccess: s3Cfg.PathStyle,
 		AccessKeyID:     awsKeyId,

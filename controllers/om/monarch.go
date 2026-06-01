@@ -8,18 +8,23 @@ import (
 	monarchpkg "github.com/mongodb/mongodb-kubernetes/pkg/monarch"
 )
 
-// MaintainedMonarchComponents is the automation config section that tells the agent
-// about the Monarch shipper/injector configuration for a cluster.
-type MaintainedMonarchComponents struct {
-	ReplicaSetID       string `json:"replicaSetId"`
-	ClusterPrefix      string `json:"clusterPrefix"`
-	InitialMode        string `json:"initialMode"`
+// AwsStorageConfig holds S3 credentials and bucket configuration nested under "awsConfig".
+type AwsStorageConfig struct {
 	AWSBucketName      string `json:"awsBucketName"`
 	AWSRegion          string `json:"awsRegion"`
 	AWSAccessKeyID     string `json:"awsAccessKeyId"`
 	AWSSecretAccessKey string `json:"awsSecretAccessKey"`
 	S3BucketEndpoint   string `json:"s3BucketEndPoint,omitempty"`
 	S3PathStyleAccess  bool   `json:"s3PathStyleAccess,omitempty"`
+}
+
+// MaintainedMonarchComponents is the automation config section that tells the agent
+// about the Monarch shipper/injector configuration for a cluster.
+type MaintainedMonarchComponents struct {
+	ReplicaSetID  string            `json:"replicaSetId"`
+	ClusterPrefix string            `json:"clusterPrefix"`
+	InitialMode   string            `json:"initialMode"`
+	AwsConfig     *AwsStorageConfig `json:"awsConfig,omitempty"`
 	// InjectorConfig is populated for standby clusters (role: standby).
 	InjectorConfig *InjectorConfig `json:"injectorConfig,omitempty"`
 	// ShipperConfig is populated for active clusters (role: active).
@@ -45,16 +50,16 @@ type MonarchInstance struct {
 	ExternallyManaged  bool   `json:"externallyManaged"`
 	HealthAPIEndpoint  string `json:"healthApiEndpoint"`
 	MonarchAPIEndpoint string `json:"monarchApiEndpoint"`
+	Mode               string `json:"mode,omitempty"`
+	BackupMongoNodeURI string `json:"backupMongoNodeURI,omitempty"`
 }
 
 // monarchShipperMode is the only valid value for ShipperConfig.Mode per ops-manager validation.
 const monarchShipperMode = "shipperAndSnapshotter"
 
 type ShipperConfig struct {
-	Version            string         `json:"version"`
-	Mode               string         `json:"mode,omitempty"`
-	BackupMongoNodeURI string         `json:"backupMongoNodeURI,omitempty"`
-	Shards             []MonarchShard `json:"shards"`
+	Version string         `json:"version"`
+	Shards  []MonarchShard `json:"shards"`
 }
 
 type InjectorConfig struct {
@@ -89,15 +94,17 @@ func BuildMaintainedMonarchComponents(mdb *mdbv1.MongoDB, rsName string, awsAcce
 	}
 
 	mc := MaintainedMonarchComponents{
-		ReplicaSetID:       rsName,
-		ClusterPrefix:      monarch.S3.GetPrefix(rsName),
-		InitialMode:        initialMode,
-		AWSBucketName:      monarch.S3.Bucket,
-		AWSRegion:          monarch.S3.Region,
-		AWSAccessKeyID:     awsAccessKeyId,
-		AWSSecretAccessKey: awsSecretAccessKey,
-		S3BucketEndpoint:   monarch.S3.Endpoint,
-		S3PathStyleAccess:  monarch.S3.PathStyle,
+		ReplicaSetID:  rsName,
+		ClusterPrefix: monarch.S3.GetPrefix(rsName),
+		InitialMode:   initialMode,
+		AwsConfig: &AwsStorageConfig{
+			AWSBucketName:      monarch.S3.Bucket,
+			AWSRegion:          monarch.S3.Region,
+			AWSAccessKeyID:     awsAccessKeyId,
+			AWSSecretAccessKey: awsSecretAccessKey,
+			S3BucketEndpoint:   monarch.S3.Endpoint,
+			S3PathStyleAccess:  monarch.S3.PathStyle,
+		},
 	}
 
 	version := extractVersionFromImage(monarch.Image)
@@ -119,11 +126,11 @@ func BuildMaintainedMonarchComponents(mdb *mdbv1.MongoDB, rsName string, awsAcce
 	}
 
 	if monarch.Role == mdbv1.MonarchRoleActive {
+		shard.Instances[0].Mode = monarchShipperMode
+		shard.Instances[0].BackupMongoNodeURI = mongoURI
 		mc.ShipperConfig = &ShipperConfig{
-			Version:            version,
-			Mode:               monarchShipperMode,
-			BackupMongoNodeURI: mongoURI,
-			Shards:             []MonarchShard{shard},
+			Version: version,
+			Shards:  []MonarchShard{shard},
 		}
 	} else {
 		mc.InjectorConfig = &InjectorConfig{

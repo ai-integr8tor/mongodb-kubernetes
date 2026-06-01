@@ -17,12 +17,14 @@ func TestSetMaintainedMonarchComponents(t *testing.T) {
 
 	mc := []MaintainedMonarchComponents{
 		{
-			ReplicaSetID:       "activeRS",
-			ClusterPrefix:      "failoverdemo",
-			AWSBucketName:      "my-bucket",
-			AWSRegion:          "us-east-1",
-			AWSAccessKeyID:     "AKID",
-			AWSSecretAccessKey: "SECRET",
+			ReplicaSetID:  "activeRS",
+			ClusterPrefix: "failoverdemo",
+			AwsConfig: &AwsStorageConfig{
+				AWSBucketName:      "my-bucket",
+				AWSRegion:          "us-east-1",
+				AWSAccessKeyID:     "AKID",
+				AWSSecretAccessKey: "SECRET",
+			},
 			InjectorConfig: &InjectorConfig{
 				Version: "0.1.1",
 				Shards: []MonarchShard{
@@ -61,7 +63,10 @@ func TestSetMaintainedMonarchComponents(t *testing.T) {
 
 	assert.Equal(t, "activeRS", result[0]["replicaSetId"])
 	assert.Equal(t, "failoverdemo", result[0]["clusterPrefix"])
-	assert.Equal(t, "my-bucket", result[0]["awsBucketName"])
+
+	awsCfg, ok := result[0]["awsConfig"].(map[string]interface{})
+	require.True(t, ok, "awsConfig should be a nested object")
+	assert.Equal(t, "my-bucket", awsCfg["awsBucketName"])
 
 	injCfg, ok := result[0]["injectorConfig"].(map[string]interface{})
 	require.True(t, ok)
@@ -121,12 +126,13 @@ func TestBuildMaintainedMonarchComponents_Standby(t *testing.T) {
 	// ReplicaSetID is the local RS name. DR pair linkage is via shared ClusterPrefix.
 	assert.Equal(t, "standby-rs", mc.ReplicaSetID)
 	assert.Equal(t, "failoverdemo", mc.ClusterPrefix)
-	assert.Equal(t, "my-bucket", mc.AWSBucketName)
-	assert.Equal(t, "us-east-1", mc.AWSRegion)
-	assert.Equal(t, "AKID", mc.AWSAccessKeyID)
-	assert.Equal(t, "SECRET", mc.AWSSecretAccessKey)
-	assert.Equal(t, "http://minio:9000", mc.S3BucketEndpoint)
-	assert.True(t, mc.S3PathStyleAccess)
+	require.NotNil(t, mc.AwsConfig)
+	assert.Equal(t, "my-bucket", mc.AwsConfig.AWSBucketName)
+	assert.Equal(t, "us-east-1", mc.AwsConfig.AWSRegion)
+	assert.Equal(t, "AKID", mc.AwsConfig.AWSAccessKeyID)
+	assert.Equal(t, "SECRET", mc.AwsConfig.AWSSecretAccessKey)
+	assert.Equal(t, "http://minio:9000", mc.AwsConfig.S3BucketEndpoint)
+	assert.True(t, mc.AwsConfig.S3PathStyleAccess)
 
 	require.NotNil(t, mc.InjectorConfig)
 	assert.Equal(t, "0.1.1", mc.InjectorConfig.Version)
@@ -162,9 +168,12 @@ func TestBuildMaintainedMonarchComponents_Active(t *testing.T) {
 	mc := result[0]
 	assert.Equal(t, "active-rs", mc.ReplicaSetID)
 	require.NotNil(t, mc.ShipperConfig)
-	assert.Equal(t, monarchShipperMode, mc.ShipperConfig.Mode)
-	assert.Equal(t, mongoURI, mc.ShipperConfig.BackupMongoNodeURI)
 	assert.Len(t, mc.ShipperConfig.Shards, 1)
+	// Mode and BackupMongoNodeURI are per-instance fields.
+	require.Len(t, mc.ShipperConfig.Shards[0].Instances, 1)
+	inst := mc.ShipperConfig.Shards[0].Instances[0]
+	assert.Equal(t, monarchShipperMode, inst.Mode)
+	assert.Equal(t, mongoURI, inst.BackupMongoNodeURI)
 	// Active clusters have no injector config.
 	assert.Nil(t, mc.InjectorConfig)
 }

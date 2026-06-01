@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -33,15 +35,25 @@ const (
 )
 
 // DRState represents the content of the DR state file in S3.
+// This matches the agent's RemoteDRState schema.
 type DRState struct {
 	// State is the current DR state (Active, Standby, PromoteStandby, StandbyReadyToPromote).
 	State State `json:"state"`
 
-	// ActiveCluster is the identifier of the currently active cluster.
-	ActiveCluster string `json:"activeCluster,omitempty"`
+	// PreviousState is the state before the last transition.
+	PreviousState string `json:"previousState,omitempty"`
 
-	// ClusterID is the identifier of the cluster that wrote this state.
-	ClusterID string `json:"clusterId,omitempty"`
+	// ClusterName is the name of the cluster that wrote this state.
+	ClusterName string `json:"clusterName"`
+
+	// Version is a monotonically increasing version number (as string).
+	Version string `json:"version"`
+
+	// LastModified is the RFC3339 timestamp of when this state was last written.
+	LastModified string `json:"lastModified"`
+
+	// SchemaVersion is the schema version for forward compatibility.
+	SchemaVersion string `json:"schemaVersion"`
 }
 
 // DRStateWithETag wraps DRState with the S3 ETag for CAS operations.
@@ -56,6 +68,7 @@ type ClientConfig struct {
 	BucketName      string
 	Region          string
 	ClusterPrefix   string
+	ClusterName     string // Used in S3 key: <prefix>/dr_status_<clusterName>.json
 	Endpoint        string // Optional custom endpoint (for MinIO)
 	PathStyleAccess bool   // Enable path-style access (for MinIO)
 	AccessKeyID     string
@@ -67,11 +80,15 @@ type Client struct {
 	s3Client      *s3.Client
 	bucketName    string
 	clusterPrefix string
+	clusterName   string
 }
 
 // drStateKey returns the S3 key for the DR state file.
 func (c *Client) drStateKey() string {
-	return fmt.Sprintf("%s/dr_state.json", c.clusterPrefix)
+	if c.clusterPrefix == "" {
+		return fmt.Sprintf("dr_status_%s.json", c.clusterName)
+	}
+	return fmt.Sprintf("%s/dr_status_%s.json", c.clusterPrefix, c.clusterName)
 }
 
 // NewClient creates a new DR state client.
@@ -112,6 +129,7 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		s3Client:      s3Client,
 		bucketName:    cfg.BucketName,
 		clusterPrefix: cfg.ClusterPrefix,
+		clusterName:   cfg.ClusterName,
 	}, nil
 }
 
@@ -204,7 +222,7 @@ var ErrCASConflict = fmt.Errorf("CAS conflict: DR state was modified by another 
 // TransitionTo attempts to transition the DR state to a new state using CAS.
 // It reads the current state, validates the transition, and writes the new state.
 // Returns the new ETag on success, or ErrCASConflict if the state was modified.
-func (c *Client) TransitionTo(ctx context.Context, newState State, clusterID string) (*DRStateWithETag, error) {
+func (c *Client) TransitionTo(ctx context.Context, newState State) (*DRStateWithETag, error) {
 	// Read current state
 	current, err := c.Read(ctx)
 	if err != nil {
@@ -213,19 +231,26 @@ func (c *Client) TransitionTo(ctx context.Context, newState State, clusterID str
 
 	// Build new state
 	var expectedETag string
-	state := DRState{
-		State:     newState,
-		ClusterID: clusterID,
-	}
+	var previousState string
+	version := "1"
 
 	if current != nil {
 		expectedETag = current.ETag
-		state.ActiveCluster = current.ActiveCluster
+		previousState = string(current.State)
 
-		// Update activeCluster when transitioning to Active
-		if newState == StateActive {
-			state.ActiveCluster = clusterID
+		// Increment version
+		if v, parseErr := strconv.Atoi(current.Version); parseErr == nil {
+			version = strconv.Itoa(v + 1)
 		}
+	}
+
+	state := DRState{
+		State:         newState,
+		PreviousState: previousState,
+		ClusterName:   c.clusterName,
+		Version:       version,
+		LastModified:  time.Now().UTC().Format(time.RFC3339),
+		SchemaVersion: "1",
 	}
 
 	// Write with CAS
