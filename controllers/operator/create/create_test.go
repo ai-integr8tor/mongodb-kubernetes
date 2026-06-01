@@ -198,9 +198,7 @@ func TestOpsManagerInKubernetes_ClusterSpecificExternalConnectivity(t *testing.T
 							util.OperatorLabelName:  util.OperatorLabelValue,
 							omv1.LabelResourceOwner: "test-om",
 						},
-						// Multi-cluster OM: the CR lives only in the central cluster.
-						// Services in member clusters must not carry a cross-cluster
-						// ownerReference or the Kubernetes GC will delete them as orphans.
+						OwnerReferences: nil,
 					},
 					Spec: corev1.ServiceSpec{
 						Ports: []corev1.ServicePort{
@@ -234,7 +232,7 @@ func TestOpsManagerInKubernetes_ClusterSpecificExternalConnectivity(t *testing.T
 							util.OperatorLabelName:  util.OperatorLabelValue,
 							omv1.LabelResourceOwner: "test-om",
 						},
-						// Multi-cluster OM: no cross-cluster ownerReference (see above).
+						OwnerReferences: nil,
 					},
 					Spec: corev1.ServiceSpec{
 						Ports: []corev1.ServicePort{
@@ -303,7 +301,7 @@ func TestOpsManagerInKubernetes_ClusterSpecificExternalConnectivity(t *testing.T
 							util.OperatorLabelName:  util.OperatorLabelValue,
 							omv1.LabelResourceOwner: "test-om",
 						},
-						// Multi-cluster OM: no cross-cluster ownerReference (see first test case).
+						OwnerReferences: nil,
 					},
 					Spec: corev1.ServiceSpec{
 						Ports: []corev1.ServicePort{
@@ -337,7 +335,7 @@ func TestOpsManagerInKubernetes_ClusterSpecificExternalConnectivity(t *testing.T
 							util.OperatorLabelName:  util.OperatorLabelValue,
 							omv1.LabelResourceOwner: "test-om",
 						},
-						// Multi-cluster OM: no cross-cluster ownerReference (see first test case).
+						OwnerReferences: nil,
 						Annotations: map[string]string{
 							"test-annotation": "test-value",
 						},
@@ -374,7 +372,7 @@ func TestOpsManagerInKubernetes_ClusterSpecificExternalConnectivity(t *testing.T
 							util.OperatorLabelName:  util.OperatorLabelValue,
 							omv1.LabelResourceOwner: "test-om",
 						},
-						// Multi-cluster OM: no cross-cluster ownerReference (see first test case).
+						OwnerReferences: nil,
 					},
 					Spec: corev1.ServiceSpec{
 						Ports: []corev1.ServicePort{

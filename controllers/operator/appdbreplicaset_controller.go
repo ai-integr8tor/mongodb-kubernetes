@@ -1774,20 +1774,10 @@ func (r *ReconcileAppDbReplicaSet) ensureProjectIDConfigMap(ctx context.Context,
 }
 
 func (r *ReconcileAppDbReplicaSet) ensureProjectIDConfigMapForCluster(ctx context.Context, opsManager *omv1.MongoDBOpsManager, projectID string, k8sClient kubernetesClient.Client) error {
-	// ownerRefs is nil in multi-cluster mode: the MongoDBOpsManager CR only exists in the
-	// central cluster, and a cross-cluster ownerReference causes the Kubernetes garbage
-	// collector to delete this ConfigMap as an orphan. Cleanup in multi-cluster mode is
-	// handled through explicit label-based deletion instead.
-	ownerRefs := r.ownerReferences
-	if opsManager.Spec.AppDB.IsMultiCluster() {
-		ownerRefs = nil
-	}
-
-	// Saving the "backup" ConfigMap which contains the project id
 	cm := configmap.Builder().
 		SetName(opsManager.Spec.AppDB.ProjectIDConfigMapName()).
 		SetLabels(opsManager.GetOwnerLabels()).
-		SetOwnerReferences(ownerRefs).
+		SetOwnerReferences(opsManager.AppDBOwnerReferenceIfNotMultiCluster()).
 		SetNamespace(opsManager.Namespace).
 		SetDataField(util.AppDbProjectIdKey, projectID).
 		Build()
@@ -1843,18 +1833,9 @@ func (r *ReconcileAppDbReplicaSet) readExistingPodVars(ctx context.Context, om *
 }
 
 func (r *ReconcileAppDbReplicaSet) publishACVersionAsConfigMap(ctx context.Context, cmName string, opsManager *omv1.MongoDBOpsManager, version int, memberCluster multicluster.MemberCluster) workflow.Status {
-	// ownerRefs is nil in multi-cluster mode: the MongoDBOpsManager CR only exists in the
-	// central cluster, and a cross-cluster ownerReference causes the Kubernetes garbage
-	// collector to delete this ConfigMap as an orphan. Cleanup in multi-cluster mode is
-	// handled through explicit label-based deletion instead.
-	ownerRefs := r.ownerReferences
-	if opsManager.Spec.AppDB.IsMultiCluster() {
-		ownerRefs = nil
-	}
-
 	acVersionConfigMap := configmap.Builder().
 		SetLabels(opsManager.GetOwnerLabels()).
-		SetOwnerReferences(ownerRefs).
+		SetOwnerReferences(opsManager.AppDBOwnerReferenceIfNotMultiCluster()).
 		SetNamespace(opsManager.Namespace).
 		SetName(cmName).
 		SetDataField(appDBACConfigMapVersionField, fmt.Sprintf("%d", version)).

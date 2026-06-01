@@ -360,18 +360,9 @@ func AppDBInKubernetes(ctx context.Context, client kubernetesClient.Client, opsM
 		return nil, err
 	}
 
-	// ownerRefs is nil in multi-cluster mode: the MongoDBOpsManager CR only exists in the
-	// central cluster, and a cross-cluster ownerReference causes the Kubernetes garbage
-	// collector to delete this service as an orphan. Cleanup in multi-cluster mode is
-	// handled through explicit label-based deletion instead.
-	ownerRefs := kube.BaseOwnerReference(opsManager)
-	if opsManager.Spec.AppDB.IsMultiCluster() {
-		ownerRefs = nil
-	}
-
 	namespacedName := kube.ObjectKey(opsManager.Namespace, set.Spec.ServiceName)
 	internalService := BuildService(namespacedName, opsManager, ptr.To(serviceSelectorLabel), nil, opsManager.Spec.AppDB.AdditionalMongodConfig.GetPortOrDefault(), omv1.MongoDBOpsManagerServiceDefinition{Type: corev1.ServiceTypeClusterIP})
-	internalService.OwnerReferences = ownerRefs
+	internalService.OwnerReferences = opsManager.AppDBOwnerReferenceIfNotMultiCluster()
 
 	// Adds Prometheus Port if Prometheus has been enabled.
 	prom := opsManager.Spec.AppDB.Prometheus
@@ -411,15 +402,7 @@ func BackupDaemonInKubernetes(ctx context.Context, client kubernetesClient.Clien
 	}
 	namespacedName := kube.ObjectKey(opsManager.Namespace, set.Spec.ServiceName)
 	internalService := BuildService(namespacedName, opsManager, &set.Spec.ServiceName, nil, construct.BackupDaemonServicePort, omv1.MongoDBOpsManagerServiceDefinition{Type: corev1.ServiceTypeClusterIP})
-	// ownerRefs is nil in multi-cluster mode: the MongoDBOpsManager CR only exists in the
-	// central cluster, and a cross-cluster ownerReference causes the Kubernetes garbage
-	// collector to delete this service as an orphan. Cleanup is handled through explicit
-	// label-based deletion instead.
-	ownerRefs := kube.BaseOwnerReference(opsManager)
-	if opsManager.Spec.IsMultiCluster() {
-		ownerRefs = nil
-	}
-	internalService.OwnerReferences = ownerRefs
+	internalService.OwnerReferences = opsManager.OwnerReferenceIfNotMultiCluster()
 	internalService.Spec.PublishNotReadyAddresses = false
 
 	return set, service.CreateOrUpdateService(ctx, client, internalService)
@@ -435,22 +418,9 @@ func OpsManagerInKubernetes(ctx context.Context, memberCluster multicluster.Memb
 
 	_, port := opsManager.GetSchemePort()
 
-	// ownerRefs is nil in multi-cluster mode: the MongoDBOpsManager CR only exists in the
-	// central cluster, and a cross-cluster ownerReference causes the Kubernetes garbage
-	// collector to delete this service as an orphan. Cleanup in multi-cluster mode is
-	// handled through explicit label-based deletion instead.
-	ownerRefs := kube.BaseOwnerReference(opsManager)
-	if opsManager.Spec.IsMultiCluster() {
-		ownerRefs = nil
-	}
-
 	namespacedName := kube.ObjectKey(opsManager.Namespace, set.Spec.ServiceName)
 	internalService := BuildService(namespacedName, opsManager, &set.Spec.ServiceName, nil, port, getInternalServiceDefinition(opsManager))
-	// ownerRefs is nil in multi-cluster mode: the MongoDBOpsManager CR only exists in the
-	// central cluster, and a cross-cluster ownerReference causes the Kubernetes garbage
-	// collector to delete this service as an orphan. Cleanup is handled through explicit
-	// label-based deletion instead.
-	internalService.OwnerReferences = ownerRefs
+	internalService.OwnerReferences = opsManager.OwnerReferenceIfNotMultiCluster()
 	internalService.Spec.PublishNotReadyAddresses = false
 
 	// add queryable backup port to service
@@ -467,8 +437,7 @@ func OpsManagerInKubernetes(ctx context.Context, memberCluster multicluster.Memb
 	namespacedName = kube.ObjectKey(opsManager.Namespace, opsManager.ExternalSvcName())
 	if externalConnectivity := opsManager.GetExternalConnectivityConfigurationForMemberCluster(memberCluster.Name); externalConnectivity != nil {
 		svc := BuildService(namespacedName, opsManager, &set.Spec.ServiceName, nil, port, *externalConnectivity)
-		// ownerRefs is nil in multi-cluster mode: see comment on internalService above.
-		svc.OwnerReferences = ownerRefs
+		svc.OwnerReferences = opsManager.OwnerReferenceIfNotMultiCluster()
 		svc.Spec.PublishNotReadyAddresses = false
 
 		// Need to create queryable backup service

@@ -19,14 +19,6 @@ func MultiClusterReplicaSetOptions(additionalOpts ...func(options *construct.Dat
 		if mdbm.Spec.StatefulSetConfiguration != nil {
 			stsSpec = mdbm.Spec.StatefulSetConfiguration.SpecWrapper.Spec
 		}
-		// OwnerReference is always nil: MongoDBMultiCluster resources are always deployed in
-		// multi-cluster mode. The CR only exists in the central cluster, and a cross-cluster
-		// ownerReference causes the Kubernetes garbage collector to delete this StatefulSet as
-		// an orphan. Cleanup is handled through explicit label-based deletion instead.
-		//
-		// Annotations carries MongoDBMultiResourceAnnotation, which replaces ownerReferences:
-		// watch predicates and the OM connection factory use it to map StatefulSets back to
-		// their parent CR.
 		opts := construct.DatabaseStatefulSetOptions{
 			Name:                          mdbm.Name,
 			ServicePort:                   mdbm.Spec.GetAdditionalMongodConfig().GetPortOrDefault(),

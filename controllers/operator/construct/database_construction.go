@@ -189,9 +189,6 @@ func ReplicaSetOptions(additionalOpts ...func(options *DatabaseStatefulSetOption
 			stsSpec = &appsv1.StatefulSetSpec{Template: *mdb.Spec.PodSpec.PodTemplateWrapper.PodTemplate}
 		}
 
-		// ReplicaSetOptions is used exclusively by the single-cluster MongoDB controller.
-		// OwnerReference is always set: the CR and the StatefulSet live in the same cluster
-		// so Kubernetes GC can clean up the StatefulSet automatically when the CR is deleted.
 		opts := DatabaseStatefulSetOptions{
 			Replicas:                scale.ReplicasThisReconciliation(&mdb),
 			Name:                    mdb.Name,
@@ -239,21 +236,12 @@ func shardedOptions(cfg shardedOptionCfg, additionalOpts ...func(options *Databa
 		podSpec = mdbv1.MongoDbPodSpec{Persistence: clusterComponentSpec.PodSpec.Persistence}
 	}
 
-	// ownerRefs is nil in multi-cluster mode: the MongoDBShardedCluster CR only exists in the
-	// central cluster, and a cross-cluster ownerReference causes the Kubernetes garbage
-	// collector to delete this StatefulSet as an orphan. Cleanup in multi-cluster mode is
-	// handled through explicit label-based deletion instead.
-	ownerRefs := kube.BaseOwnerReference(&cfg.mdb)
-	if cfg.mdb.Spec.IsMultiCluster() {
-		ownerRefs = nil
-	}
-
 	opts := DatabaseStatefulSetOptions{
 		Name:                    cfg.rsName,
 		ServiceName:             cfg.serviceName,
 		PodSpec:                 NewDefaultPodSpecWrapper(podSpec),
 		ServicePort:             cfg.componentSpec.GetAdditionalMongodConfig().GetPortOrDefault(),
-		OwnerReference:          ownerRefs,
+		OwnerReference:          cfg.mdb.OwnerReferenceIfNotMultiCluster(),
 		AgentConfig:             cfg.componentSpec.GetAgentConfig(),
 		StatefulSetSpecOverride: statefulSetSpecOverride,
 		Labels:                  cfg.mdb.Labels,
@@ -263,9 +251,6 @@ func shardedOptions(cfg shardedOptionCfg, additionalOpts ...func(options *Databa
 	}
 
 	if cfg.mdb.Spec.IsMultiCluster() {
-		// The MongoDBMultiResourceAnnotation replaces ownerReferences in multi-cluster mode:
-		// watch predicates and the OM connection factory use it to map StatefulSets back to
-		// their parent CR.
 		opts.Annotations = handler.MultiClusterStatefulSetAnnotations(cfg.mdb.Name)
 		opts.HostNameOverrideConfigmapName = cfg.mdb.GetHostNameOverrideConfigmapName()
 	}
