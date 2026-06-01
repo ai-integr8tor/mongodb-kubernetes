@@ -252,8 +252,8 @@ def _build_om_from_source(
     """Build Ops Manager from local source using Bazel."""
     import subprocess
 
-    if not os.path.isfile(os.path.join(om_path, "WORKSPACE")):
-        raise ValueError(f"Invalid ops-manager path: {om_path} (no WORKSPACE file)")
+    if not (os.path.isfile(os.path.join(om_path, "WORKSPACE")) or os.path.isfile(os.path.join(om_path, "MODULE.bazel"))):
+        raise ValueError(f"Invalid ops-manager path: {om_path} (no WORKSPACE or MODULE.bazel file)")
 
     logger.info(f"Building Ops Manager from source: {om_path}")
 

@@ -52,6 +52,7 @@ type MonarchInstance struct {
 	MonarchAPIEndpoint string `json:"monarchApiEndpoint"`
 	Mode               string `json:"mode,omitempty"`
 	BackupMongoNodeURI string `json:"backupMongoNodeURI,omitempty"`
+	SrcURI             string `json:"srcURI,omitempty"`
 }
 
 // monarchShipperMode is the only valid value for ShipperConfig.Mode per ops-manager validation.
@@ -64,7 +65,6 @@ type ShipperConfig struct {
 
 type InjectorConfig struct {
 	Version string         `json:"version"`
-	SrcURI  string         `json:"srcURI,omitempty"`
 	Shards  []MonarchShard `json:"shards"`
 }
 
@@ -133,9 +133,9 @@ func BuildMaintainedMonarchComponents(mdb *mdbv1.MongoDB, rsName string, awsAcce
 			Shards:  []MonarchShard{shard},
 		}
 	} else {
+		shard.Instances[0].SrcURI = mongoURI
 		mc.InjectorConfig = &InjectorConfig{
 			Version: version,
-			SrcURI:  mongoURI,
 			Shards:  []MonarchShard{shard},
 		}
 	}

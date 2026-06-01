@@ -136,7 +136,6 @@ func TestBuildMaintainedMonarchComponents_Standby(t *testing.T) {
 
 	require.NotNil(t, mc.InjectorConfig)
 	assert.Equal(t, "0.1.1", mc.InjectorConfig.Version)
-	assert.Equal(t, mongoURI, mc.InjectorConfig.SrcURI)
 	require.Len(t, mc.InjectorConfig.Shards, 1)
 
 	shard := mc.InjectorConfig.Shards[0]
@@ -154,6 +153,7 @@ func TestBuildMaintainedMonarchComponents_Standby(t *testing.T) {
 	assert.True(t, inst.ExternallyManaged)
 	assert.Equal(t, serviceDNS+":8080", inst.HealthAPIEndpoint)
 	assert.Equal(t, serviceDNS+":1122", inst.MonarchAPIEndpoint)
+	assert.Equal(t, mongoURI, inst.SrcURI)
 }
 
 func TestBuildMaintainedMonarchComponents_Active(t *testing.T) {

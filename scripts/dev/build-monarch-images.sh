@@ -105,6 +105,10 @@ build_image() {
 
 cd "${PROJECT_DIR}"
 
+# Ensure AWS/ECR credentials are fresh before building
+echo "Refreshing AWS/ECR credentials..."
+make -s aws_login
+
 echo "============================================"
 echo "Building Monarch test images (parallel)"
 echo "============================================"
