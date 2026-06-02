@@ -118,6 +118,16 @@ func (m *MongoDB) GetSpec() DbSpec {
 	return &m.Spec
 }
 
+// OwnerReferenceIfNotMultiCluster returns the owner reference to this MongoDB, or nil in
+// multi-cluster mode where the CR lives only in the central cluster and a cross-cluster
+// reference would be garbage-collected as an orphan.
+func (m *MongoDB) OwnerReferenceIfNotMultiCluster() []metav1.OwnerReference {
+	if m.Spec.IsMultiCluster() {
+		return nil
+	}
+	return kube.BaseOwnerReference(m)
+}
+
 func (m *MongoDB) GetProjectConfigMapNamespace() string {
 	return m.GetNamespace()
 }
