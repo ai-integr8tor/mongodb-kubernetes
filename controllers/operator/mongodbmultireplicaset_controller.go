@@ -1164,11 +1164,6 @@ func AddMultiReplicaSetController(ctx context.Context, mgr manager.Manager, imag
 		}
 	}
 
-	// In multi-cluster mode, watch StatefulSet status changes in each member cluster and
-	// enqueue a reconciliation request for the owning MongoDBMultiCluster CR.
-	// The MongoDBMultiResourceAnnotation on each StatefulSet carries the CR name (set in
-	// MultiClusterReplicaSetOptions); EnqueueRequestForOwnerMultiCluster reads it to build
-	// the request.
 	for clusterName, memberCluster := range memberClustersMap {
 		err = c.Watch(source.Kind[client.Object](memberCluster.GetCache(), &appsv1.StatefulSet{}, &khandler.EnqueueRequestForOwnerMultiCluster{}, watch.PredicatesForMultiStatefulSet()))
 		if err != nil {

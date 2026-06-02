@@ -61,7 +61,7 @@ func DatabaseInKubernetes(ctx context.Context, client kubernetesClient.Client, m
 
 	namespacedName := kube.ObjectKey(mdb.Namespace, set.Spec.ServiceName)
 	internalService := BuildService(namespacedName, &mdb, &set.Spec.ServiceName, nil, opts.ServicePort, omv1.MongoDBOpsManagerServiceDefinition{Type: corev1.ServiceTypeClusterIP})
-	internalService.OwnerReferences = kube.BaseOwnerReference(&mdb)
+	internalService.OwnerReferences = mdb.OwnerReferenceIfNotMultiCluster()
 
 	// Adds Prometheus Port if Prometheus has been enabled.
 	prom := mdb.GetPrometheus()
@@ -244,7 +244,7 @@ func createExternalServices(ctx context.Context, client kubernetesClient.Client,
 	}
 	// TODO: we should not use OpsManager specific type `omv1.MongoDBOpsManagerServiceDefinition`
 	externalService := BuildService(namespacedName, &mdb, &set.Spec.ServiceName, ptr.To(dns.GetPodName(set.Name, podNum)), opts.ServicePort, omv1.MongoDBOpsManagerServiceDefinition{Type: corev1.ServiceTypeLoadBalancer})
-	externalService.OwnerReferences = kube.BaseOwnerReference(&mdb)
+	externalService.OwnerReferences = mdb.OwnerReferenceIfNotMultiCluster()
 
 	if mdb.Spec.DbCommonSpec.GetExternalDomain() != nil {
 		// When an external domain is defined, we put it into process.hostname in automation config. Because of that we need to define additional well-defined port for backups.
