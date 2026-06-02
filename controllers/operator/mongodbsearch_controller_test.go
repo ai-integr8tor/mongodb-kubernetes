@@ -178,6 +178,38 @@ func TestMongoDBSearchReconcile_MissingSource(t *testing.T) {
 	assert.True(t, res.RequeueAfter > 0)
 }
 
+func TestMongoDBSearchReconcile_DisableReconciliationAnnotation_SkipsReconcile(t *testing.T) {
+	ctx := context.Background()
+
+	// CR is annotated disabled but has a missing source — without the
+	// short-circuit, Reconcile would set Status.Phase=Failed. The
+	// short-circuit must return Result{} + nil without touching status.
+	search := newMongoDBSearch("search", mock.TestNamespace, "missing-source")
+	search.Annotations = map[string]string{
+		searchv1.DisableReconciliationAnnotation: "true",
+	}
+	reconciler, c := newSearchReconciler(nil, search)
+
+	res, err := reconciler.Reconcile(
+		ctx,
+		reconcile.Request{NamespacedName: types.NamespacedName{Name: search.Name, Namespace: search.Namespace}},
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, reconcile.Result{}, res)
+
+	// Status untouched — would be Failed if reconcile had proceeded
+	// (MissingSource path sets PhaseFailed).
+	updated := &searchv1.MongoDBSearch{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Name: search.Name, Namespace: search.Namespace}, updated))
+	assert.Empty(t, updated.Status.Phase)
+	assert.Empty(t, updated.Status.Message)
+
+	// No StatefulSet was created either.
+	sts := &appsv1.StatefulSet{}
+	err = c.Get(ctx, search.StatefulSetNamespacedNameForCluster(0), sts)
+	assert.True(t, apiErrors.IsNotFound(err), "no StatefulSet should be created when reconciliation is disabled, got err=%v", err)
+}
+
 func TestMongoDBSearchReconcile_Success(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -212,7 +244,7 @@ func TestMongoDBSearchReconcile_Success(t *testing.T) {
 			checkSearchReconcileSuccessful(ctx, t, reconciler, c, search)
 
 			svc := &corev1.Service{}
-			err := c.Get(ctx, search.SearchServiceNamespacedName(), svc)
+			err := c.Get(ctx, search.SearchServiceNamespacedNameForCluster(0), svc)
 			assert.NoError(t, err)
 			servicePortNames := []string{}
 			for _, port := range svc.Spec.Ports {
@@ -225,7 +257,7 @@ func TestMongoDBSearchReconcile_Success(t *testing.T) {
 			assert.ElementsMatch(t, expectedPortNames, servicePortNames)
 
 			cm := &corev1.ConfigMap{}
-			err = c.Get(ctx, search.MongotConfigConfigMapNamespacedName(), cm)
+			err = c.Get(ctx, search.MongotConfigConfigMapNameForCluster(0), cm)
 			assert.NoError(t, err)
 			expectedConfig := buildExpectedMongotConfig(search, mdbc)
 			configYaml, err := yaml.Marshal(expectedConfig)
@@ -237,7 +269,7 @@ func TestMongoDBSearchReconcile_Success(t *testing.T) {
 			assert.Equal(t, operatorConfig.SearchVersion, updatedSearch.Status.Version)
 
 			sts := &appsv1.StatefulSet{}
-			err = c.Get(ctx, search.StatefulSetNamespacedName(), sts)
+			err = c.Get(ctx, search.StatefulSetNamespacedNameForCluster(0), sts)
 			assert.NoError(t, err)
 		})
 	}
