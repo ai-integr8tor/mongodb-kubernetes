@@ -1454,6 +1454,7 @@ func TestCollectOperatorSnapshot(t *testing.T) {
 				OperatorType:         MEKO,
 				OperatorArchitecture: runtime.GOARCH,
 				OperatorOS:           runtime.GOOS,
+				OperatorInstaller:    "yaml",
 			},
 		},
 		"multi cluster": {
@@ -1466,6 +1467,7 @@ func TestCollectOperatorSnapshot(t *testing.T) {
 				OperatorType:         MEKO,
 				OperatorArchitecture: runtime.GOARCH,
 				OperatorOS:           runtime.GOOS,
+				OperatorInstaller:    "yaml",
 			},
 		},
 	}
@@ -1486,7 +1488,7 @@ func TestCollectOperatorSnapshot(t *testing.T) {
 
 			ctx := context.Background()
 
-			events := collectOperatorSnapshot(ctx, test.memberClusterMap, mgr, testOperatorUUID, "", "")
+			events := collectOperatorSnapshot(ctx, test.memberClusterMap, mgr, testOperatorUUID, "yaml")
 
 			require.Len(t, events, 1, "expected exactly one operator event")
 			event := events[0]
@@ -1498,6 +1500,7 @@ func TestCollectOperatorSnapshot(t *testing.T) {
 			assert.Equal(t, runtime.GOOS, event.Properties["operatorOS"])
 			assert.Equal(t, testOperatorUUID, event.Properties["operatorID"])
 			assert.Equal(t, string(MEKO), event.Properties["operatorType"])
+			assert.Equal(t, "yaml", event.Properties["operatorInstaller"])
 
 			assert.Contains(t, event.Properties, "kubernetesClusterID")
 			assert.Contains(t, event.Properties, "kubernetesClusterIDs")
