@@ -1,5 +1,11 @@
 .dir-locals.el
-.idea/
+.idea/workspace.xml
+.idea/usage.statistics.xml
+.idea/shelf
+.idea/AugmentWebviewStateStore.xml
+.idea/go.imports.xml
+
+
 
 /pkg/client
 /vendor/
@@ -22,7 +28,6 @@ venv
 **/pytest_cache/
 tmp/*
 bin/*
-**/*.iml
 helm_out
 .redo-last-namespace
 exports.do
@@ -82,9 +87,6 @@ downloadIstioCandidate.sh
 .operator-dev
 tmp
 
-# agent build override (temp file, deleted after use)
-scripts/dev/agent/.override
-
 licenses_full.csv
 licenses_stderr
 docker/mongodb-kubernetes-tests/.test_identifiers*
@@ -104,5 +106,8 @@ mongodb-kubernetes-*.tgz
 
 scripts/code_snippets/tests/outputs/*
 
-package.tar.gz
-.build-cache/
+.claude
+
+# mckctl binary (built at repo root by `go build ./cmd/mckctl`)
+/mckctl
+

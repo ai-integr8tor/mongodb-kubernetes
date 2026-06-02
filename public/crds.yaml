@@ -5329,6 +5329,8 @@ spec:
                           type: object
                         type: array
                       replicaSet:
+                        description: OverrideReplicaSet holds replica set override
+                          fields for the AutomationConfig.
                         properties:
                           id:
                             description: |-
@@ -7359,6 +7361,8 @@ spec:
                       type: object
                     type: array
                   replicaSet:
+                    description: OverrideReplicaSet holds replica set override fields
+                      for the AutomationConfig.
                     properties:
                       id:
                         description: |-

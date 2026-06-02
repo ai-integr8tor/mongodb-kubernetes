@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	mdbv1 "github.com/mongodb/mongodb-kubernetes/api/v1/mdb"
+	mdbv1 "github.com/mongodb/mongodb-kubernetes/api/mongodb/v1/mdb"
 	monarchpkg "github.com/mongodb/mongodb-kubernetes/pkg/monarch"
 )
 
